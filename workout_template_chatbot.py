@@ -567,7 +567,7 @@ class FlexibleConversationState:
             
             if extracted_days > 0 or context_days:
                 return FlexibleConversationState.STATES["ASK_NAMES"]
-            return current_state  # Stay and re-ask
+            return current_state  # Stay and re-message
           
        elif current_state == FlexibleConversationState.STATES["ASK_NAMES"]:
            # Always proceed to generation after names
@@ -847,7 +847,7 @@ async def ultra_flexible_workout_stream(
                yield _evt({
                    "type": "workout_template",
                    "status": "hint",
-                   "ask": "Want to edit something? Just tell me what to change, or say 'create new template' to start fresh. I'm here to help with whatever you need!"
+                   "message": "Want to edit something? Just tell me what to change, or say 'create new template' to start fresh. I'm here to help with whatever you need!"
                })
                yield "event: done\ndata: [DONE]\n\n"
            return StreamingResponse(_show_saved(), media_type="text/event-stream",
@@ -857,7 +857,7 @@ async def ultra_flexible_workout_stream(
                yield _evt({
                    "type": "workout_template",
                    "status": "hint",
-                   "ask": "No saved template found yet. Want me to create one? Just say something like 'make me a workout plan' or 'create template' and we'll get started!"
+                   "message": "No saved template found yet. Want me to create one? Just say something like 'make me a workout plan' or 'create template' and we'll get started!"
                })
                yield "event: done\ndata: [DONE]\n\n"
            return StreamingResponse(_no_template(), media_type="text/event-stream",
@@ -946,7 +946,7 @@ async def ultra_flexible_workout_stream(
                     yield _evt({
                         "type": "workout_template",
                         "status": "ask_edit_decision",
-                        "ask": SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
+                        "message": SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
                     })
                     
                 except Exception as e:
@@ -960,7 +960,7 @@ async def ultra_flexible_workout_stream(
                     yield _evt({
                         "type": "workout_template",
                         "status": "ask_days", 
-                        "ask": SmartResponseGenerator.get_contextual_prompt("ASK_DAYS", {"profile": prof})
+                        "message": SmartResponseGenerator.get_contextual_prompt("ASK_DAYS", {"profile": prof})
                     })
             else:
                 # FIXED: Check if we already have day information from initial request
@@ -977,10 +977,10 @@ async def ultra_flexible_workout_stream(
                     yield _evt({
                         "type": "workout_template",
                         "status": "ask_names",
-                        "ask": f"Perfect - {workout_info['days_count']} workout days! " + SmartResponseGenerator.get_contextual_prompt("ASK_NAMES")
+                        "message": f"Perfect - {workout_info['days_count']} workout days! " + SmartResponseGenerator.get_contextual_prompt("ASK_NAMES")
                     })
                 else:
-                    # Standard flow - ask for days
+                    # Standard flow - message for days
                     await mem.set_pending(user_id, {
                         "state": FlexibleConversationState.STATES["ASK_DAYS"],
                         "profile": prof
@@ -989,7 +989,7 @@ async def ultra_flexible_workout_stream(
                     yield _evt({
                         "type": "workout_template",
                         "status": "ask_days", 
-                        "ask": SmartResponseGenerator.get_contextual_prompt("ASK_DAYS", {"profile": prof})
+                        "message": SmartResponseGenerator.get_contextual_prompt("ASK_DAYS", {"profile": prof})
                     })
             
         return StreamingResponse(_fetch_and_proceed(), media_type="text/event-stream",
@@ -1010,7 +1010,7 @@ async def ultra_flexible_workout_stream(
            yield _evt({
                "type": "workout_template",
                "status": "ask_names",
-               "ask": f"Perfect - {days_count} workout days it is! " + SmartResponseGenerator.get_contextual_prompt("ASK_NAMES")
+               "message": f"Perfect - {days_count} workout days it is! " + SmartResponseGenerator.get_contextual_prompt("ASK_NAMES")
            })
            yield "event: done\ndata: [DONE]\n\n"
           
@@ -1164,7 +1164,7 @@ async def ultra_flexible_workout_stream(
                 yield _evt({
                     "type": "workout_template",
                     "status": "ask_edit_decision",
-                    "ask": SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
+                    "message": SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
                 })
                 
             except Exception as e:
@@ -1172,7 +1172,7 @@ async def ultra_flexible_workout_stream(
                 yield _evt({
                     "type": "workout_template",
                     "status": "error",
-                    "ask": "Had trouble generating your leg workout. Want to try again with a different approach?"
+                    "message": "Had trouble generating your leg workout. Want to try again with a different approach?"
                 })
             
             yield "event: done\ndata: [DONE]\n\n"
@@ -1201,7 +1201,7 @@ async def ultra_flexible_workout_stream(
                 yield _evt({
                     "type": "workout_template",
                     "status": "hint",
-                    "ask": "I need a template to edit first! Say 'create template' to make a new one, or 'show template' if you have one saved."
+                    "message": "I need a template to edit first! Say 'create template' to make a new one, or 'show template' if you have one saved."
                 })
                 yield "event: done\ndata: [DONE]\n\n"
             return StreamingResponse(_need_template(), media_type="text/event-stream",
@@ -1250,7 +1250,7 @@ async def ultra_flexible_workout_stream(
             yield _evt({
                 "type": "workout_template",
                 "status": "ask_edit_decision", 
-                "ask": SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
+                "": SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
             })
             
         except Exception as e:
@@ -1258,7 +1258,7 @@ async def ultra_flexible_workout_stream(
             yield _evt({
                 "type": "workout_template",
                 "status": "error",
-                "ask": "Had trouble applying that change. Can you try describing it differently?"
+                "message": "Had trouble applying that change. Can you try describing it differently?"
             })
         
         yield "event: done\ndata: [DONE]\n\n"
@@ -1282,7 +1282,7 @@ async def ultra_flexible_workout_stream(
            yield _evt({
                "type": "workout_template",
                "status": "confirm_save",
-               "ask": SmartResponseGenerator.get_contextual_prompt("CONFIRM_SAVE")
+               "message": SmartResponseGenerator.get_contextual_prompt("CONFIRM_SAVE")
            })
            yield "event: done\ndata: [DONE]\n\n"
           
@@ -1326,13 +1326,13 @@ async def ultra_flexible_workout_stream(
                yield _evt({
                    "type": "workout_template",
                    "status": "done",
-                   "ask": "Perfect! Your personalized workout is ready. You can say 'show my template' anytime to view it, or 'edit template' to make changes. What would you like to do next?"
+                   "message": "Perfect! Your personalized workout is ready. You can say 'show my template' anytime to view it, or 'edit template' to make changes. What would you like to do next?"
                })
            else:
                yield _evt({
                    "type": "workout_template",
                    "status": "error",
-                   "ask": "Sorry, couldn't save the template right now. Want to try again? Just say 'save it' once more!"
+                   "message": "Sorry, couldn't save the template right now. Want to try again? Just say 'save it' once more!"
                })
           
            yield "event: done\ndata: [DONE]\n\n"
@@ -1363,7 +1363,7 @@ async def ultra_flexible_workout_stream(
             yield _evt({
                 "type": "workout_template",
                 "status": "confirm_save",
-                "ask": SmartResponseGenerator.get_contextual_prompt("CONFIRM_SAVE")
+                "message": SmartResponseGenerator.get_contextual_prompt("CONFIRM_SAVE")
             })
             yield "event: done\ndata: [DONE]\n\n"
             
@@ -1382,7 +1382,7 @@ async def ultra_flexible_workout_stream(
             yield _evt({
                 "type": "workout_template",
                 "status": "confirm_save",
-                "ask": SmartResponseGenerator.get_contextual_prompt("CONFIRM_SAVE")
+                "message": SmartResponseGenerator.get_contextual_prompt("CONFIRM_SAVE")
             })
             yield "event: done\ndata: [DONE]\n\n"
             
@@ -1400,7 +1400,7 @@ async def ultra_flexible_workout_stream(
                     yield _evt({
                         "type": "workout_template",
                         "status": "error",
-                        "ask": "I seem to have lost your template. Let me recreate it for you. Could you say 'create new template' to start fresh?"
+                        "message": "I seem to have lost your template. Let me recreate it for you. Could you say 'create new template' to start fresh?"
                     })
                     return
                 
@@ -1422,7 +1422,7 @@ async def ultra_flexible_workout_stream(
                         yield _evt({
                             "type": "workout_template",
                             "status": "ask_edit_decision",
-                            "ask": SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
+                            "message": SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
                         })
                         return
                 
@@ -1464,7 +1464,7 @@ async def ultra_flexible_workout_stream(
                 yield _evt({
                     "type": "workout_template",
                     "status": "ask_edit_decision",
-                    "ask": SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
+                    "message": SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
                 })
                
             except Exception as e:
@@ -1472,7 +1472,7 @@ async def ultra_flexible_workout_stream(
                 yield _evt({
                     "type": "workout_template",
                     "status": "error",
-                    "ask": "Had trouble with that change. Can you try rephrasing what you'd like me to modify?"
+                    "message": "Had trouble with that change. Can you try rephrasing what you'd like me to modify?"
                 })
            
             yield "event: done\ndata: [DONE]\n\n"
@@ -1495,7 +1495,7 @@ async def ultra_flexible_workout_stream(
                 yield _evt({
                     "type": "workout_template",
                     "status": "error",
-                    "ask": "The template appears to be corrupted or empty. Let me help you create a new one. Say 'create template' to start fresh."
+                    "message": "The template appears to be corrupted or empty. Let me help you create a new one. Say 'create template' to start fresh."
                 })
                 yield "event: done\ndata: [DONE]\n\n"
                 return
@@ -1529,13 +1529,13 @@ async def ultra_flexible_workout_stream(
                 yield _evt({
                     "type": "workout_template",
                     "status": "done",
-                    "ask": "All set! You can view your template anytime by saying 'show my template', or create variations with 'edit template'. What else can I help you with?"
+                    "message": "All set! You can view your template anytime by saying 'show my template', or create variations with 'edit template'. What else can I help you with?"
                 })
             else:
                 yield _evt({
                     "type": "workout_template",
                     "status": "error",
-                    "ask": "Couldn't save right now - want to try again? Just say 'save' or let me know!"
+                    "message": "Couldn't save right now - want to try again? Just say 'save' or let me know!"
                 })
             
             yield "event: done\ndata: [DONE]\n\n"
@@ -1555,7 +1555,7 @@ async def ultra_flexible_workout_stream(
             yield _evt({
                 "type": "workout_template",
                 "status": "ask_edit_decision",
-                "ask": "No problem! " + SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
+                "message": "No problem! " + SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
             })
             yield "event: done\ndata: [DONE]\n\n"
             
@@ -1572,7 +1572,7 @@ async def ultra_flexible_workout_stream(
                     yield _evt({
                         "type": "workout_template",
                         "status": "error",
-                        "ask": "The template seems corrupted. Let me help create a new one. Say 'create template' to start over."
+                        "message": "The template seems corrupted. Let me help create a new one. Say 'create template' to start over."
                     })
                     yield "event: done\ndata: [DONE]\n\n"
                     return
@@ -1616,7 +1616,7 @@ async def ultra_flexible_workout_stream(
                 yield _evt({
                     "type": "workout_template",
                     "status": "ask_edit_decision",
-                    "ask": SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
+                    "message": SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
                 })
                
             except Exception as e:
@@ -1624,7 +1624,7 @@ async def ultra_flexible_workout_stream(
                 yield _evt({
                     "type": "workout_template",
                     "status": "confirm_save",
-                    "ask": "Didn't catch that change. " + SmartResponseGenerator.get_contextual_prompt("CONFIRM_SAVE")
+                    "message": "Didn't catch that change. " + SmartResponseGenerator.get_contextual_prompt("CONFIRM_SAVE")
                 })
            
             yield "event: done\ndata: [DONE]\n\n"
@@ -1651,7 +1651,7 @@ async def ultra_flexible_workout_stream(
            yield _evt({
                "type": "workout_template",
                "status": "ask_names",
-               "ask": f"Perfect - {days_count} workout days! " + SmartResponseGenerator.get_contextual_prompt("ASK_NAMES")
+               "message": f"Perfect - {days_count} workout days! " + SmartResponseGenerator.get_contextual_prompt("ASK_NAMES")
            })
            yield "event: done\ndata: [DONE]\n\n"
           
@@ -1717,7 +1717,7 @@ async def ultra_flexible_workout_stream(
                yield _evt({
                    "type": "workout_template",
                    "status": "ask_edit_decision",
-                   "ask": SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
+                   "message": SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
                })
               
            except Exception as e:
@@ -1725,7 +1725,7 @@ async def ultra_flexible_workout_stream(
                yield _evt({
                    "type": "workout_template",
                    "status": "error",
-                   "ask": "Had trouble creating your template. Want to try different names or start over? I'm flexible!"
+                   "message": "Had trouble creating your template. Want to try different names or start over? I'm flexible!"
                })
           
            yield "event: done\ndata: [DONE]\n\n"
@@ -1744,7 +1744,7 @@ async def ultra_flexible_workout_stream(
            yield _evt({
                "type": "workout_template",
                "status": "hint",
-               "ask": "I'm your workout template assistant! I can help you create personalized plans, show existing templates, or make edits. Just tell me what you need - like 'make me a workout', 'show my plan', or 'change my routine'. What sounds good?"
+               "message": "I'm your workout template assistant! I can help you create personalized plans, show existing templates, or make edits. Just tell me what you need - like 'make me a workout', 'show my plan', or 'change my routine'. What sounds good?"
            })
       
        elif current_state == FlexibleConversationState.STATES["START"]:
@@ -1752,7 +1752,7 @@ async def ultra_flexible_workout_stream(
            yield _evt({
                "type": "workout_template",
                "status": "hint",
-               "ask": "Let's create something amazing! Tell me you want a workout plan and I'll build one just for you. You can say anything like 'create workout', 'make me a routine', or 'I need a plan' - I understand natural language!"
+               "message": "Let's create something amazing! Tell me you want a workout plan and I'll build one just for you. You can say anything like 'create workout', 'make me a routine', or 'I need a plan' - I understand natural language!"
            })
           
        elif current_state == FlexibleConversationState.STATES["ASK_DAYS"]:
@@ -1760,7 +1760,7 @@ async def ultra_flexible_workout_stream(
            yield _evt({
                "type": "workout_template",
                "status": "ask_days",
-               "ask": f"I'm listening! For your workout frequency, you can say things like '{days_count} days', 'Monday through Friday', 'usual schedule', or however you prefer to describe it!"
+               "message": f"I'm listening! For your workout frequency, you can say things like '{days_count} days', 'Monday through Friday', 'usual schedule', or however you prefer to describe it!"
            })
           
        elif current_state == FlexibleConversationState.STATES["ASK_NAMES"]:
@@ -1768,7 +1768,7 @@ async def ultra_flexible_workout_stream(
            yield _evt({
                "type": "workout_template",
                "status": "ask_names",
-               "ask": f"Almost there! I need {days_count} names for your workout days. You can say 'default days', list muscle groups like 'Push, Pull, Legs', or be creative with your own names!"
+               "message": f"Almost there! I need {days_count} names for your workout days. You can say 'default days', list muscle groups like 'Push, Pull, Legs', or be creative with your own names!"
            })
           
        else:
@@ -1776,7 +1776,7 @@ async def ultra_flexible_workout_stream(
            yield _evt({
                "type": "workout_template",
                "status": "hint",
-               "ask": "I didn't quite catch that, but I'm here to help! You can describe what you want naturally - like 'yes', 'no', 'change this exercise', 'make it harder', or tell me exactly what you're thinking. What would you like to do?"
+               "message": "I didn't quite catch that, but I'm here to help! You can describe what you want naturally - like 'yes', 'no', 'change this exercise', 'make it harder', or tell me exactly what you're thinking. What would you like to do?"
            })
       
        yield "event: done\ndata: [DONE]\n\n"
@@ -1912,6 +1912,3 @@ class ConversationLogger:
    def log_parsing_result(user_input: str, parsing_results: Dict[str, Any]):
        print(f"🔍 PARSING: '{user_input}'")
        print(f"   Results: {parsing_results}")
-
-
-
