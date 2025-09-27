@@ -1205,8 +1205,8 @@ async def ultra_flexible_workout_stream(
             
             yield _evt({
                 "type": "workout_template",
-                "status": "ask_edit_decision", 
-                "": SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
+                "status": "ask_edit_decision",
+                "message": SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
             })
             
         except Exception as e:
@@ -1404,6 +1404,7 @@ async def ultra_flexible_workout_stream(
                     "template_markdown": md,
                     "template_json": new_tpl,
                     "template_ids": tpl_ids,
+                    "message": _format_template_for_display(new_tpl),
                     "summary": summary or "Updated as requested!"
                 })
                
@@ -1546,6 +1547,7 @@ async def ultra_flexible_workout_stream(
                     "template_markdown": md,
                     "template_json": new_tpl,
                     "template_ids": tpl_ids,
+                    "message": _format_template_for_display(new_tpl),
                     "summary": summary or "Made that change!"
                 })
                
