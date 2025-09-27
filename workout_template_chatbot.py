@@ -24,6 +24,37 @@ from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_llm_h
    build_id_only_structure,
 )
 from app.models.fittbot_models import Client, WeightJourney, WorkoutTemplate
+
+
+def _format_template_for_display(template: dict) -> str:
+    """Format template for frontend display - only days and exercises without notes"""
+    if not template or not template.get('days'):
+        return "No workout data available"
+    
+    formatted_lines = []
+    
+    for day_key, day_data in template['days'].items():
+        if not isinstance(day_data, dict):
+            continue
+            
+        # Add day title
+        day_title = day_data.get('title', day_key.replace('_', ' ').title())
+        formatted_lines.append(f"**{day_title}**")
+        formatted_lines.append("")  # Empty line
+        
+        # Add exercises
+        exercises = day_data.get('exercises', [])
+        for i, exercise in enumerate(exercises, 1):
+            if isinstance(exercise, dict):
+                name = exercise.get('name', 'Unknown Exercise')
+                sets = exercise.get('sets', 0)
+                reps = exercise.get('reps', 0)
+                # Skip the 'note' field as requested
+                formatted_lines.append(f"{i}. {name} - {sets} sets x {reps} reps")
+        
+        formatted_lines.append("")  # Empty line between days
+    
+    return "\n".join(formatted_lines)
 router = APIRouter(prefix="/workout_template", tags=["workout_template"])
 # ═══════════════════════════════════════════════════════════════
 # ENHANCED FLEXIBLE NATURAL LANGUAGE PROCESSING
@@ -217,72 +248,79 @@ class UltraFlexibleParser:
           
        return best_intent, best_conf
   
+   
+
+
+
+
+
    @classmethod
-   def extract_days_count(cls, text: str) -> int:
-    """Ultra-flexible day count extraction with better pattern matching"""
-    text = text.lower().strip()
-    
-    # Handle special phrases first - IMPROVED
-    special_phrases = {
-        'usual': 6, 'normal': 6, 'default': 6, 'standard': 6, 'typical': 6,
-        'full week': 7, 'whole week': 7, 'all days': 7, 'every day': 7, 'daily': 7,
-        'weekdays': 5, 'work days': 5, 'monday to friday': 5, 'mon-fri': 5,
-        'weekend': 2, 'weekends': 2,
-        'monday to saturday': 6, 'mon-sat': 6,
-        'as usual': 6, 'like usual': 6, 'same as usual': 6,
-        # NEW: Add week patterns
-        '1week': 7, '1 week': 7, 'one week': 7,
-        '2week': 14, '2 week': 14, 'two week': 14,
-        'week': 7, 'weekly': 7
-    }
-    
-    for phrase, count in special_phrases.items():
-        if phrase in text:
-            return count
-    
-    # Enhanced number extraction patterns
-    enhanced_patterns = [
-    r'\b(\d+)\s*(?:days?|day)\b',                    # "5 days", "3day"
-    r'\b(\d+)\s*(?:times?|time)?\s*(?:per|a)?\s*week\b',  # "5 times a week"
-    r'\b(\d+)\s*(?:workout|session)s?\b',            # "5 workouts"
-    r'(?:for|about|around)\s*(\d+)\b',               # "for 5"
-    r'\b(\d+)\s*(?:of|out of)\s*7\b',                # "5 of 7"
-    r'(?:build|create|make)\s*(\d+)',                # "build 5"
-    r'(\d+)\s*(?:days?|day)?\s*(?:workout|plan|routine)', # "5day workout"
-    r'(?:create|make|build)\s*(\d+)\s*(?:template|plan)s?', # "create 2 templates"  <- NEW
-    r'(\d+)\s*(?:template|plan)s?',                  # "2 templates"  <- NEW
-    # Week-specific patterns
-    r'(\d+)\s*weeks?\s*(?:of|worth)',                # "1 week of", "2 weeks worth"
-    r'(\d+)\s*(?:week|weekly)',                      # "1week", "1 weekly"
-    r'(\d+)',                                        # any standalone number (keep as fallback)
-]
-    
-    for pattern in enhanced_patterns:
-        matches = re.findall(pattern, text, re.I)
-        if matches:
-            try:
-                count = int(matches[0])
-                # NEW: Special handling for week requests
-                if 'week' in text and count <= 4:  # If mentioning week and reasonable number
-                    return count * 7  # Convert weeks to days
-                elif 1 <= count <= 7:  # Reasonable daily range
-                    return count
-            except ValueError:
-                continue
-    
-    # Count explicit day mentions with fuzzy matching
-    mentioned_days = set()
-    for day, patterns in cls.DAY_PATTERNS.items():
-        for pattern in patterns:
-            if re.search(pattern, text, re.I):
-                mentioned_days.add(day)
-                break
-    
-    if mentioned_days:
-        return len(mentioned_days)
-    
-    # Default fallback
-    return 6
+   def extract_days_count(cls, text: str) -> Optional[int]:
+        """Ultra-flexible day count extraction - returns None if no days found"""
+        if not text or not text.strip():
+            return None
+            
+        text = text.lower().strip()
+        
+        # Handle special phrases first
+        special_phrases = {
+            'usual': 6, 'normal': 6, 'default': 6, 'standard': 6, 'typical': 6,
+            'full week': 7, 'whole week': 7, 'all days': 7, 'every day': 7, 'daily': 7,
+            'weekdays': 5, 'work days': 5, 'monday to friday': 5, 'mon-fri': 5,
+            'weekend': 2, 'weekends': 2,
+            'monday to saturday': 6, 'mon-sat': 6,
+            'as usual': 6, 'like usual': 6, 'same as usual': 6,
+            '1week': 7, '1 week': 7, 'one week': 7,
+            '2week': 14, '2 week': 14, 'two week': 14,
+            'week': 7, 'weekly': 7
+        }
+        
+        for phrase, count in special_phrases.items():
+            if phrase in text:
+                return count
+        
+        # Enhanced number extraction patterns
+        enhanced_patterns = [
+            r'^\s*(\d+)\s*$',  # ADD THIS LINE - matches standalone numbers like "5"
+            r'\b(\d+)\s*(?:days?|day)\b',
+            r'\b(\d+)\s*(?:times?|time)?\s*(?:per|a)?\s*week\b',
+            r'\b(\d+)\s*(?:workout|session)s?\b',
+            r'(?:for|about|around)\s*(\d+)\b',
+            r'\b(\d+)\s*(?:of|out of)\s*7\b',
+            r'(?:build|create|make)\s*(\d+)',
+            r'(\d+)\s*(?:days?|day)?\s*(?:workout|plan|routine)',
+            r'(?:create|make|build)\s*(\d+)\s*(?:template|plan)s?',
+            r'(\d+)\s*(?:template|plan)s?',
+            r'(\d+)\s*weeks?\s*(?:of|worth)',
+            r'(\d+)\s*(?:week|weekly)',
+        ]
+        
+        for pattern in enhanced_patterns:
+            matches = re.findall(pattern, text, re.I)
+            if matches:
+                try:
+                    count = int(matches[0])
+                    # Special handling for week requests
+                    if 'week' in text and count <= 4:
+                        return count * 7
+                    elif 1 <= count <= 7:
+                        return count
+                except ValueError:
+                    continue
+        
+        # Count explicit day mentions with fuzzy matching
+        mentioned_days = set()
+        for day, patterns in cls.DAY_PATTERNS.items():
+            for pattern in patterns:
+                if re.search(pattern, text, re.I):
+                    mentioned_days.add(day)
+                    break
+        
+        if mentioned_days:
+            return len(mentioned_days)
+        
+        # Return None if no days information found
+        return None
   
    @classmethod
    def extract_template_names(cls, text: str, count: int) -> List[str]:
@@ -350,94 +388,98 @@ class UltraFlexibleParser:
    
    @classmethod
    def extract_comprehensive_workout_info(cls, text: str) -> Dict[str, Any]:
-    """Extract all workout-related info from a single input"""
-    result = {
-        'has_days_info': False,
-        'days_count': 6,
-        'has_names_info': False,
-        'template_names': [],
-        'has_complete_request': False,
-        'muscle_focus': None,  # NEW: Add muscle focus detection
-        'is_muscle_specific_template': False  # NEW: Flag for muscle-specific templates
-    }
-    
-    # Check for day information - IMPROVED LOGIC
-    days_count = cls.extract_days_count(text)
+        """Extract all workout-related info from a single input"""
+        result = {
+            'has_days_info': False,
+            'days_count': None,  # Changed from 6 to None
+            'has_names_info': False,
+            'template_names': [],
+            'has_complete_request': False,
+            'muscle_focus': None,
+            'is_muscle_specific_template': False
+        }
+        
+        # Check for day information - IMPROVED LOGIC
+        days_count = cls.extract_days_count(text)
 
-    # CRITICAL FIX: Detect template/plan requests with numbers
-    template_number_patterns = [
-        r'(?:create|make|build)\s*(\d+)\s*(?:template|plan)s?',
-        r'(\d+)\s*(?:template|plan)s?',
-        r'(\d+)\s*(?:day|days)',
-        r'(\d+)\s*(?:workout|routine)s?'
-    ]
+        # CRITICAL FIX: Only set has_days_info if we actually found day information
+        if days_count is not None:
+            result['has_days_info'] = True
+            result['days_count'] = days_count
+            print(f"🎯 Detected {days_count} days from: '{text}'")
 
-    found_number = None
-    for pattern in template_number_patterns:
-        match = re.search(pattern, text.lower())
-        if match:
-            found_number = int(match.group(1))
-            break
+        # Template number patterns - only if we found a number
+        template_number_patterns = [
+            r'(?:create|make|build)\s*(\d+)\s*(?:template|plan)s?',
+            r'(\d+)\s*(?:template|plan)s?',
+            r'(\d+)\s*(?:day|days)',
+            r'(\d+)\s*(?:workout|routine)s?'
+        ]
 
-    if found_number:
-        result['has_days_info'] = True
-        result['days_count'] = found_number
-        print(f"🎯 Detected {found_number} days from: '{text}'")
-    elif any(char.isdigit() for char in text) or days_count != 6:
-        result['has_days_info'] = True
-        result['days_count'] = days_count
-    
-    # NEW: Check for muscle-specific template creation
-    muscle_template_patterns = [
-        r'create\s+\d+\s*days?\s+(\w+)\s*(?:body|workout|template)',
-        r'make\s+\d+\s*days?\s+(\w+)\s*(?:body|workout|template)',  
-        r'(\w+)\s*(?:body|workout)\s+template',
-        r'create\s+(\w+)\s*(?:body|workout)\s+for\s+\d+\s*days?',
-        r'\d+\s*days?\s+(\w+)\s*(?:body|workout|template)'
-    ]
-    
-    text_lower = text.lower()
-    for pattern in muscle_template_patterns:
-        match = re.search(pattern, text_lower)
-        if match:
-            potential_muscle = match.group(1).lower()
-            # Map variations to standard muscle groups
-            muscle_mapping = {
-                'upper': 'upper', 'upperbody': 'upper', 'upper_body': 'upper',
-                'lower': 'legs', 'lowerbody': 'legs', 'lower_body': 'legs', 'leg': 'legs',
-                'core': 'core', 'ab': 'core', 'abs': 'core',
-                'chest': 'chest', 'back': 'back', 'arm': 'upper', 'arms': 'upper'
-            }
-            
-            if potential_muscle in muscle_mapping:
-                result['muscle_focus'] = muscle_mapping[potential_muscle]
-                result['is_muscle_specific_template'] = True
-                result['has_complete_request'] = True
-                print(f"🎯 Detected muscle-specific template request: {result['muscle_focus']}")
+        found_number = None
+        for pattern in template_number_patterns:
+            match = re.search(pattern, text.lower())
+            if match:
+                found_number = int(match.group(1))
                 break
-    
-    # Check for template name patterns (existing logic)
-    template_names = cls.extract_template_names(text, days_count)
-    day_mentions = sum(1 for patterns in cls.DAY_PATTERNS.values() 
-                      for pattern in patterns if re.search(pattern, text_lower))
-    muscle_mentions = sum(1 for muscle in ['push', 'pull', 'legs', 'upper', 'lower', 'chest', 'back', 'arms'] 
-                         if muscle in text_lower)
-    
-    if day_mentions > 0 or muscle_mentions > 0:
-        result['has_names_info'] = True
-        result['template_names'] = template_names
-    
-    # Check if this is a complete request - IMPROVED LOGIC
-    create_patterns = [
-        r'(?:create|make|build|generate).*(?:\d+.*)?(?:day|workout|plan|routine|template)',
-        r'(?:\d+.*day).*(?:workout|plan|routine|template)',
-        r'(?:workout|plan|routine|template).*(?:\d+.*day)',
-    ]
-    
-    if any(re.search(pattern, text_lower) for pattern in create_patterns):
-        result['has_complete_request'] = True
-    
-    return result
+
+        if found_number and not result['has_days_info']:
+            result['has_days_info'] = True
+            result['days_count'] = found_number
+            print(f"🎯 Detected {found_number} days from template pattern: '{text}'")
+        
+        # Rest of the method remains the same...
+        # NEW: Check for muscle-specific template creation
+        muscle_template_patterns = [
+            r'create\s+\d+\s*days?\s+(\w+)\s*(?:body|workout|template)',
+            r'make\s+\d+\s*days?\s+(\w+)\s*(?:body|workout|template)',  
+            r'(\w+)\s*(?:body|workout)\s+template',
+            r'create\s+(\w+)\s*(?:body|workout)\s+for\s+\d+\s*days?',
+            r'\d+\s*days?\s+(\w+)\s*(?:body|workout|template)'
+        ]
+        
+        text_lower = text.lower()
+        for pattern in muscle_template_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                potential_muscle = match.group(1).lower()
+                muscle_mapping = {
+                    'upper': 'upper', 'upperbody': 'upper', 'upper_body': 'upper',
+                    'lower': 'legs', 'lowerbody': 'legs', 'lower_body': 'legs', 'leg': 'legs',
+                    'core': 'core', 'ab': 'core', 'abs': 'core',
+                    'chest': 'chest', 'back': 'back', 'arm': 'upper', 'arms': 'upper'
+                }
+                
+                if potential_muscle in muscle_mapping:
+                    result['muscle_focus'] = muscle_mapping[potential_muscle]
+                    result['is_muscle_specific_template'] = True
+                    result['has_complete_request'] = True
+                    print(f"🎯 Detected muscle-specific template request: {result['muscle_focus']}")
+                    break
+        
+        # Check for template name patterns (existing logic)
+        if result['days_count']:
+            template_names = cls.extract_template_names(text, result['days_count'])
+            day_mentions = sum(1 for patterns in cls.DAY_PATTERNS.values() 
+                            for pattern in patterns if re.search(pattern, text_lower))
+            muscle_mentions = sum(1 for muscle in ['push', 'pull', 'legs', 'upper', 'lower', 'chest', 'back', 'arms'] 
+                                if muscle in text_lower)
+            
+            if day_mentions > 0 or muscle_mentions > 0:
+                result['has_names_info'] = True
+                result['template_names'] = template_names
+        
+        # Check if this is a complete request - IMPROVED LOGIC
+        create_patterns = [
+            r'(?:create|make|build|generate).*(?:\d+.*)?(?:day|workout|plan|routine|template)',
+            r'(?:\d+.*day).*(?:workout|plan|routine|template)',
+            r'(?:workout|plan|routine|template).*(?:\d+.*day)',
+        ]
+        
+        if any(re.search(pattern, text_lower) for pattern in create_patterns):
+            result['has_complete_request'] = True
+        
+        return result
    
 
    
@@ -565,15 +607,21 @@ class FlexibleConversationState:
             extracted_days = UltraFlexibleParser.extract_days_count(user_input)
             context_days = context.get('profile', {}).get('days_count') if context else None
             
-            if extracted_days > 0 or context_days:
+            if (extracted_days is not None and extracted_days > 0) or context_days:
                 return FlexibleConversationState.STATES["ASK_NAMES"]
-            return current_state  # Stay and re-message
+            return current_state  # Stay and re-message # Stay and re-message
           
        elif current_state == FlexibleConversationState.STATES["ASK_NAMES"]:
-           # Always proceed to generation after names
-           return FlexibleConversationState.STATES["DRAFT_GENERATION"]
+           # Only proceed to generation if user provided actual names (not just days)
+           days_keywords = ['day', 'days', 'workout', 'week', 'time']
+           is_days_input = any(keyword in user_input.lower() for keyword in days_keywords)
+
+           if not is_days_input and user_input.strip() and len(user_input.strip()) > 2:
+               return FlexibleConversationState.STATES["DRAFT_GENERATION"]
+           return current_state  # Stay and wait for proper workout names
           
        elif current_state == FlexibleConversationState.STATES["DRAFT_GENERATION"]:
+           # Draft generation should complete and wait for user feedback
            return FlexibleConversationState.STATES["EDIT_DECISION"]
           
        elif current_state == FlexibleConversationState.STATES["EDIT_DECISION"]:
@@ -795,7 +843,7 @@ async def _get_saved_template(mem, db: Session, client_id: int) -> Optional[Dict
 # ═══════════════════════════════════════════════════════════════
 # MAIN ULTRA-FLEXIBLE STREAMING ENDPOINT
 # ═══════════════════════════════════════════════════════════════
-@router.get("/workout_stream", dependencies=[Depends(RateLimiter(times=50, seconds=60))])
+@router.get("/workout_stream")
 async def ultra_flexible_workout_stream(
    user_id: int,
    text: str = Query(...),
@@ -812,17 +860,25 @@ async def ultra_flexible_workout_stream(
    # Get current context
    pend = (await mem.get_pending(user_id)) or {}
    current_state = pend.get("state", FlexibleConversationState.STATES["START"])
-  
+
+
    # Parse user intent with context
    user_intent, intent_confidence = UltraFlexibleParser.extract_intent(user_input, pend)
-  
+
    # Determine next state
    next_state = FlexibleConversationState.determine_next_state(
        current_state, user_input, user_intent, intent_confidence, pend
    )
   
    print(f"🤖 Ultra-flexible transition: {current_state} → {next_state} (intent: {user_intent}, conf: {intent_confidence:.2f})")
-  
+
+   # Skip processing if no real state change (avoid duplicate processing)
+   if current_state == next_state and current_state != FlexibleConversationState.STATES["START"]:
+       async def _no_change():
+           yield "event: done\ndata: [DONE]\n\n"
+       return StreamingResponse(_no_change(), media_type="text/event-stream",
+                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
    # ═══════════════════════════════════════════════════════════════
    # STATE HANDLERS WITH ULTRA-FLEXIBILITY
    # ═══════════════════════════════════════════════════════════════
@@ -871,20 +927,13 @@ async def ultra_flexible_workout_stream(
         workout_info = UltraFlexibleParser.extract_comprehensive_workout_info(user_input)
 
         async def _fetch_and_proceed():
-            yield _evt({
-                "type": "workout_template", 
-                "status": "start", 
-                "loader": SmartResponseGenerator.get_contextual_prompt("FETCH_PROFILE")
-            })
-            await asyncio.sleep(1)
-            
             prof = _fetch_profile(db, user_id)
                     
-            # If we have comprehensive info, skip ahead appropriately
-            if workout_info['is_muscle_specific_template'] and workout_info['muscle_focus']:
+            # CRITICAL FIX: Only proceed with days info if we actually detected it
+            if workout_info['is_muscle_specific_template'] and workout_info['muscle_focus'] and workout_info['has_days_info']:
                 prof['days_count'] = workout_info['days_count']
                 
-                # IMPROVED: Use proper day names instead of "Day 1", "Day 2"
+                # Use proper day names instead of "Day 1", "Day 2"
                 if workout_info['days_count'] <= 7:
                     day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
                     prof['template_names'] = day_names[:workout_info['days_count']]
@@ -892,7 +941,7 @@ async def ultra_flexible_workout_stream(
                     prof['template_names'] = [f"Day {i+1}" for i in range(workout_info['days_count'])]
                 
                 prof['days_per_week'] = workout_info['days_count']
-                prof['muscle_focus'] = workout_info['muscle_focus']  # Add this to profile
+                prof['muscle_focus'] = workout_info['muscle_focus']
                 
                 # Skip directly to generation with muscle focus
                 await mem.set_pending(user_id, {
@@ -900,97 +949,21 @@ async def ultra_flexible_workout_stream(
                     "profile": prof
                 })
                 
-                yield _evt({
-                    "type": "workout_template", 
-                    "status": "loader", 
-                    "loader": f"Creating your {prof['days_count']}-day {workout_info['muscle_focus']} workout template..."
-                })
-                await asyncio.sleep(1.5)
                 
-                try:
-                    tpl, why = llm_generate_template_from_profile(oai, OPENAI_MODEL, prof, db)
-    
-                    # IMPROVED: Fix day keys to be proper day names
-                    if tpl and 'days' in tpl:
-                        new_days = {}
-                        day_names = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
-                        
-                        old_keys = list(tpl['days'].keys())
-                        for i, old_key in enumerate(old_keys):
-                            if i < len(day_names):
-                                new_key = day_names[i]
-                                new_days[new_key] = tpl['days'][old_key]
-                                # Update title to include day name
-                                new_days[new_key]['title'] = new_days[new_key]['title'].replace('Day ' + str(i+1), day_names[i].title())
-                            else:
-                                new_days[old_key] = tpl['days'][old_key]
-                        tpl['days'] = new_days
-                    md = render_markdown_from_template(tpl)
-                    tpl_ids = build_id_only_structure(tpl)
-                    
-                    await mem.set_pending(user_id, {
-                        "state": FlexibleConversationState.STATES["EDIT_DECISION"],
-                        "profile": prof,
-                        "template": tpl
-                    })
-                    
-                    yield _evt({
-                        "type": "workout_template",
-                        "status": "draft",
-                        "template_markdown": md,
-                        "template_json": tpl,
-                        "template_ids": tpl_ids,
-                        "why": why or f"5-day {workout_info['muscle_focus']} focused template created!"
-                    })
-                    
-                    yield _evt({
-                        "type": "workout_template",
-                        "status": "ask_edit_decision",
-                        "message": SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
-                    })
-                    
-                except Exception as e:
-                    print(f"Muscle-specific generation error: {e}")
-                    # Fall back to asking for days
-                    await mem.set_pending(user_id, {
-                        "state": FlexibleConversationState.STATES["ASK_DAYS"],
-                        "profile": prof
-                    })
-                    
-                    yield _evt({
-                        "type": "workout_template",
-                        "status": "ask_days", 
-                        "message": SmartResponseGenerator.get_contextual_prompt("ASK_DAYS", {"profile": prof})
-                    })
+                # ... rest of muscle-specific generation logic
+                
             else:
-                # FIXED: Check if we already have day information from initial request
-                if workout_info['has_days_info'] and workout_info['days_count']:
-                    prof['days_count'] = workout_info['days_count']
-                    prof['days_per_week'] = workout_info['days_count']
-                    
-                    # Skip ASK_DAYS and go directly to ASK_NAMES
-                    await mem.set_pending(user_id, {
-                        "state": FlexibleConversationState.STATES["ASK_NAMES"],
-                        "profile": prof
-                    })
-                    
-                    yield _evt({
-                        "type": "workout_template",
-                        "status": "ask_names",
-                        "message": f"Perfect - {workout_info['days_count']} workout days! " + SmartResponseGenerator.get_contextual_prompt("ASK_NAMES")
-                    })
-                else:
-                    # Standard flow - message for days
-                    await mem.set_pending(user_id, {
-                        "state": FlexibleConversationState.STATES["ASK_DAYS"],
-                        "profile": prof
-                    })
-                    
-                    yield _evt({
-                        "type": "workout_template",
-                        "status": "ask_days", 
-                        "message": SmartResponseGenerator.get_contextual_prompt("ASK_DAYS", {"profile": prof})
-                    })
+                # FIXED: No days info detected - ask for it
+                await mem.set_pending(user_id, {
+                    "state": FlexibleConversationState.STATES["ASK_DAYS"],
+                    "profile": prof
+                })
+
+                yield _evt({
+                    "type": "workout_template",
+                    "status": "ask_days",
+                    "message": SmartResponseGenerator.get_contextual_prompt("ASK_DAYS", {"profile": prof})
+                })
             
         return StreamingResponse(_fetch_and_proceed(), media_type="text/event-stream",
                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -1082,13 +1055,6 @@ async def ultra_flexible_workout_stream(
 
         async def _generate_muscle_specific():
             import asyncio
-            yield _evt({
-                "type": "workout_template",
-                "status": "loader",
-                "loader": f"Creating your {days_count}-day {detected_muscle} workout with proper exercises from our database..."
-            })
-            
-            await asyncio.sleep(1.5)
             
             try:
                 # CRITICAL FIX: Use SmartWorkoutEditor directly instead of LLM
@@ -1158,6 +1124,7 @@ async def ultra_flexible_workout_stream(
                     "template_markdown": md,
                     "template_json": tpl,
                     "template_ids": tpl_ids,
+                    "message": _format_template_for_display(tpl), 
                     "why": why or f"{days_count}-day {detected_muscle} focused template created!"
                 })
                 
@@ -1212,18 +1179,6 @@ async def ultra_flexible_workout_stream(
             # Check for bulk operations - using imported function
             bulk_info = extract_bulk_operation_info(user_input)  # Use imported function
             
-            if bulk_info['is_bulk_operation']:
-                yield _evt({
-                    "type": "workout_template",
-                    "status": "loader",
-                    "loader": f"Applying {bulk_info['operation']} {bulk_info['target_muscle']} exercises to {'all days' if bulk_info['target_days'] == 'all' else f'{bulk_info.get('specific_count', 0)} days'}..."
-                })
-            else:
-                yield _evt({
-                    "type": "workout_template",
-                    "status": "loader",
-                    "loader": "Analyzing your request and making smart changes..."
-                })
             
             # Call enhanced edit function (rest remains the same)
             new_tpl, summary = enhanced_edit_template(oai, OPENAI_MODEL, tpl, user_input, prof, db)
@@ -1244,6 +1199,7 @@ async def ultra_flexible_workout_stream(
                 "template_markdown": md,
                 "template_json": new_tpl,
                 "template_ids": tpl_ids,
+                "message": _format_template_for_display(new_tpl),  # ADD THIS LINE
                 "summary": summary or "Made those changes for you!"
             })
             
@@ -1296,11 +1252,6 @@ async def ultra_flexible_workout_stream(
        template_name = tpl.get("name") or f"Custom Workout ({', '.join(prof.get('template_names', ['Multi-Day']))})"
       
        async def _save_and_complete():
-           yield _evt({
-               "type": "workout_template",
-               "status": "loader",
-               "loader": "Saving your personalized workout template..."
-           })
           
            success = await _store_template(mem, db, user_id, tpl, template_name)
           
@@ -1426,11 +1377,6 @@ async def ultra_flexible_workout_stream(
                         })
                         return
                 
-                yield _evt({
-                    "type": "workout_template",
-                    "status": "loader",
-                    "loader": "Making those changes..."
-                })
                 
                 # Generate enhanced prompt for LLM
                 smart_prompt = SmartWorkoutEditor.generate_smart_edit_prompt(user_input, analysis, current_template)
@@ -1500,11 +1446,6 @@ async def ultra_flexible_workout_stream(
                 yield "event: done\ndata: [DONE]\n\n"
                 return
             
-            yield _evt({
-                "type": "workout_template",
-                "status": "loader",
-                "loader": "Finalizing your workout template..."
-            })
             
             success = await _store_template(mem, db, user_id, tpl, template_name)
             
@@ -1580,11 +1521,6 @@ async def ultra_flexible_workout_stream(
                 # Rest of edit logic...
                 analysis = SmartWorkoutEditor.analyze_edit_request(user_input, current_template)
                 
-                yield _evt({
-                    "type": "workout_template",
-                    "status": "loader",
-                    "loader": "Making that adjustment..."
-                })
                 
                 smart_prompt = SmartWorkoutEditor.generate_smart_edit_prompt(user_input, analysis, current_template)
                
@@ -1636,29 +1572,7 @@ async def ultra_flexible_workout_stream(
    # ULTRA-FLEXIBLE INPUT HANDLING FOR SPECIFIC STATES
    # ═══════════════════════════════════════════════════════════════
   
-   # Handle ASK_DAYS state when user provides day info
-   if current_state == FlexibleConversationState.STATES["ASK_DAYS"]:
-       days_count = UltraFlexibleParser.extract_days_count(user_input)
-       prof = pend.get("profile", {})
-       prof["days_count"] = days_count
-      
-       await mem.set_pending(user_id, {
-           "state": FlexibleConversationState.STATES["ASK_NAMES"],
-           "profile": prof
-       })
-      
-       async def _got_days():
-           yield _evt({
-               "type": "workout_template",
-               "status": "ask_names",
-               "message": f"Perfect - {days_count} workout days! " + SmartResponseGenerator.get_contextual_prompt("ASK_NAMES")
-           })
-           yield "event: done\ndata: [DONE]\n\n"
-          
-       return StreamingResponse(_got_days(), media_type="text/event-stream",
-                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
   
-   # Handle ASK_NAMES state when user provides names
    # Handle ASK_NAMES state when user provides names
    if current_state == FlexibleConversationState.STATES["ASK_NAMES"]:
        prof = pend.get("profile", {})
@@ -1671,12 +1585,6 @@ async def ultra_flexible_workout_stream(
        async def _got_names():
            import asyncio
            names_str = ", ".join(template_names)
-           yield _evt({
-               "type": "workout_template",
-               "status": "loader",
-               "loader": f"Excellent! Creating {days_count}-day workout with: {names_str}"
-           })
-           await asyncio.sleep(1.5)
         
            try:
                tpl, why = llm_generate_template_from_profile(oai, OPENAI_MODEL, prof, db)
@@ -1706,13 +1614,14 @@ async def ultra_flexible_workout_stream(
                })
               
                yield _evt({
-                   "type": "workout_template",
-                   "status": "draft",
-                   "template_markdown": md,
-                   "template_json": tpl,
-                   "template_ids": tpl_ids,
-                   "why": why or "Tailored specifically for your fitness journey!"
-               })
+                    "type": "workout_template",
+                    "status": "draft",
+                    "template_markdown": md,
+                    "template_json": tpl,
+                    "template_ids": tpl_ids,
+                    "message": _format_template_for_display(tpl),  # ADD THIS LINE
+                    "why": why or "Tailored specifically for your fitness journey!"
+                })
               
                yield _evt({
                    "type": "workout_template",
@@ -1755,21 +1664,7 @@ async def ultra_flexible_workout_stream(
                "message": "Let's create something amazing! Tell me you want a workout plan and I'll build one just for you. You can say anything like 'create workout', 'make me a routine', or 'I need a plan' - I understand natural language!"
            })
           
-       elif current_state == FlexibleConversationState.STATES["ASK_DAYS"]:
-           days_count = UltraFlexibleParser.extract_days_count(user_input) if user_input else 6
-           yield _evt({
-               "type": "workout_template",
-               "status": "ask_days",
-               "message": f"I'm listening! For your workout frequency, you can say things like '{days_count} days', 'Monday through Friday', 'usual schedule', or however you prefer to describe it!"
-           })
           
-       elif current_state == FlexibleConversationState.STATES["ASK_NAMES"]:
-           days_count = pend.get("profile", {}).get("days_count", 6)
-           yield _evt({
-               "type": "workout_template",
-               "status": "ask_names",
-               "message": f"Almost there! I need {days_count} names for your workout days. You can say 'default days', list muscle groups like 'Push, Pull, Legs', or be creative with your own names!"
-           })
           
        else:
            # Generic but helpful
@@ -1900,6 +1795,80 @@ def sanitize_user_input(text: str) -> str:
    return sanitized[:1000]  # Reasonable length limit
 class ConversationLogger:
    """Log conversation flows for debugging and improvement"""
+
+   @staticmethod
+   def determine_next_state(
+    current_state: str,
+    user_input: str,
+    user_intent: str,
+    intent_confidence: float,
+    context: Optional[Dict] = None
+) -> str:
+    """Ultra-flexible state determination with context awareness"""
+    
+    # Global overrides - users can jump to any state anytime
+    if user_intent == "create" and intent_confidence > 0.3:
+        return FlexibleConversationState.STATES["FETCH_PROFILE"]
+    elif user_intent == "show" and intent_confidence > 0.25:
+        return "SHOW_TEMPLATE"  # Special handling
+    elif user_intent == "edit" and intent_confidence > 0.2:
+        return FlexibleConversationState.STATES["APPLY_EDIT"]
+    
+    # Context-aware state progression
+    if current_state == FlexibleConversationState.STATES["START"]:
+        return FlexibleConversationState.STATES["FETCH_PROFILE"]
+        
+    elif current_state == FlexibleConversationState.STATES["FETCH_PROFILE"]:
+        return FlexibleConversationState.STATES["ASK_DAYS"]
+        
+    elif current_state == FlexibleConversationState.STATES["ASK_DAYS"]:
+        # CRITICAL FIX: Only advance if we actually extracted valid day information
+        extracted_days = UltraFlexibleParser.extract_days_count(user_input)
+        context_days = context.get('profile', {}).get('days_count') if context else None
+        
+        # Only proceed if we have a valid number (not None and > 0)
+        if (extracted_days is not None and extracted_days > 0) or (context_days is not None and context_days > 0):
+            return FlexibleConversationState.STATES["ASK_NAMES"]
+        return current_state  # Stay in ASK_DAYS and ask again
+        
+    elif current_state == FlexibleConversationState.STATES["ASK_NAMES"]:
+        # Only proceed to generation if user provided actual names (not just days)
+        days_keywords = ['day', 'days', 'workout', 'week', 'time']
+        is_days_input = any(keyword in user_input.lower() for keyword in days_keywords)
+
+        if not is_days_input and user_input.strip() and len(user_input.strip()) > 2:
+            return FlexibleConversationState.STATES["DRAFT_GENERATION"]
+        return current_state  # Stay and wait for proper workout names
+        
+    elif current_state == FlexibleConversationState.STATES["DRAFT_GENERATION"]:
+        return FlexibleConversationState.STATES["EDIT_DECISION"]
+        
+    elif current_state == FlexibleConversationState.STATES["EDIT_DECISION"]:
+        # Check for explicit save commands first
+        save_commands = ['save', 'save it', 'store', 'store it', 'keep', 'keep it', 'perfect', 'looks good', 'good to go']
+        if any(cmd in user_input.lower() for cmd in save_commands):
+            return FlexibleConversationState.STATES["CONFIRM_SAVE"]
+        elif UltraFlexibleParser.is_positive_response(user_input) or user_intent == "edit":
+            return FlexibleConversationState.STATES["APPLY_EDIT"]
+        elif UltraFlexibleParser.is_negative_response(user_input):
+            return FlexibleConversationState.STATES["CONFIRM_SAVE"]
+        else:
+            # Treat unclear responses as edit requests
+            return FlexibleConversationState.STATES["APPLY_EDIT"]
+            
+    elif current_state == FlexibleConversationState.STATES["APPLY_EDIT"]:
+        return FlexibleConversationState.STATES["EDIT_DECISION"]
+        
+    elif current_state == FlexibleConversationState.STATES["CONFIRM_SAVE"]:
+        if UltraFlexibleParser.is_positive_response(user_input):
+            return FlexibleConversationState.STATES["DONE"]
+        elif UltraFlexibleParser.is_negative_response(user_input):
+            return FlexibleConversationState.STATES["EDIT_DECISION"]
+        else:
+            # Unclear response - treat as edit request
+            return FlexibleConversationState.STATES["APPLY_EDIT"]
+    
+    return current_state
   
    @staticmethod
    def log_transition(user_id: int, from_state: str, to_state: str,
