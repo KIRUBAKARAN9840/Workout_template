@@ -27,21 +27,36 @@ from app.models.fittbot_models import Client, WeightJourney, WorkoutTemplate
 
 
 def _format_template_for_display(template: dict) -> str:
-    """Format template for frontend display - only days and exercises without notes"""
+    """Format template for frontend display - includes day names and muscle focus"""
     if not template or not template.get('days'):
         return "No workout data available"
-    
+
     formatted_lines = []
-    
+    day_count = 1
+
     for day_key, day_data in template['days'].items():
         if not isinstance(day_data, dict):
             continue
-            
-        # Add day title
-        day_title = day_data.get('title', day_key.replace('_', ' ').title())
-        formatted_lines.append(f"**{day_title}**")
+
+        # Get the title from the template data (which should include custom names)
+        title = day_data.get('title', '')
+
+        # Create comprehensive day header
+        if title:
+            # Use the custom title which may include custom day names like "Monster Day — Upper Body"
+            if "—" in title or ":" in title:
+                # Title already has custom formatting, just add day number
+                combined_title = f"**Day {day_count}: {title}**"
+            else:
+                # Simple title, combine with day number
+                combined_title = f"**Day {day_count}: {title}**"
+        else:
+            # Fallback to cleaned up key name
+            combined_title = f"**Day {day_count}: {day_key.replace('_', ' ').title()}**"
+
+        formatted_lines.append(combined_title)
         formatted_lines.append("")  # Empty line
-        
+
         # Add exercises
         exercises = day_data.get('exercises', [])
         for i, exercise in enumerate(exercises, 1):
@@ -49,11 +64,11 @@ def _format_template_for_display(template: dict) -> str:
                 name = exercise.get('name', 'Unknown Exercise')
                 sets = exercise.get('sets', 0)
                 reps = exercise.get('reps', 0)
-                # Skip the 'note' field as requested
                 formatted_lines.append(f"{i}. {name} - {sets} sets x {reps} reps")
-        
+
         formatted_lines.append("")  # Empty line between days
-    
+        day_count += 1
+
     return "\n".join(formatted_lines)
 router = APIRouter(prefix="/workout_template", tags=["workout_template"])
 # ═══════════════════════════════════════════════════════════════
@@ -326,14 +341,25 @@ class UltraFlexibleParser:
    def extract_template_names(cls, text: str, count: int) -> List[str]:
        """Ultra-flexible template name extraction"""
        text = text.lower().strip()
+
+       # Handle empty input or "nothing" keywords - return proper day names immediately
+       nothing_keywords = ['nothing', 'no', 'skip', 'default', 'defaults', 'normal', 'standard', 'none', 'nope', 'nah']
+       if not text or len(text) < 2 or text in nothing_keywords:
+           default_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+           return default_days[:count] if count <= 7 else [f"Day {i+1}" for i in range(count)]
+
        if ',' in text:
         custom_names = [name.strip().title() for name in text.split(',') if name.strip()]
         if len(custom_names) >= count:
             return custom_names[:count]
         elif len(custom_names) > 0:
-            # Pad with sequential names if needed
+            # Pad with proper day names if needed
+            default_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
             while len(custom_names) < count:
-                custom_names.append(f"Day{len(custom_names)+1}")
+                if len(custom_names) < 7:
+                    custom_names.append(default_days[len(custom_names)])
+                else:
+                    custom_names.append(f"Day {len(custom_names)+1}")
             return custom_names[:count]
     
        # Handle default requests
@@ -382,9 +408,48 @@ class UltraFlexibleParser:
        quoted = re.findall(r'"([^"]+)"', text) + re.findall(r"'([^']+)'", text)
        if len(quoted) >= count:
            return [name.strip().title() for name in quoted[:count]]
-      
-       # Fallback to defaults
-       return [f"Day{i+1}" for i in range(count)]
+
+       # ENHANCED: Try to extract space-separated custom names like "monster day crunch day"
+       # Look for patterns like "word day" repeated
+       day_pattern = r'(\w+\s+day)'
+       day_matches = re.findall(day_pattern, text, re.I)
+       if len(day_matches) >= count:
+           return [match.strip().title() for match in day_matches[:count]]
+
+       # Try to extract any meaningful words that could be day names
+       # Skip common words that aren't likely to be custom day names
+       skip_words = {
+           'workout', 'template', 'plan', 'routine', 'exercise', 'training', 'fitness',
+           'create', 'make', 'build', 'generate', 'want', 'need', 'like', 'prefer',
+           'days', 'day', 'times', 'week', 'monday', 'tuesday', 'wednesday', 'thursday',
+           'friday', 'saturday', 'sunday', 'the', 'and', 'or', 'but', 'for', 'with'
+       }
+
+       words = [word.strip() for word in text.split() if word.strip()]
+       potential_names = []
+
+       for word in words:
+           if (len(word) > 2 and
+               word.lower() not in skip_words and
+               not word.isdigit() and
+               len(potential_names) < count):
+               potential_names.append(word.title())
+
+       if len(potential_names) >= count:
+           return potential_names[:count]
+       elif len(potential_names) > 0:
+           # Pad with proper day names if we found some custom names
+           default_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+           while len(potential_names) < count:
+               if len(potential_names) < 7:
+                   potential_names.append(default_days[len(potential_names)])
+               else:
+                   potential_names.append(f"Day {len(potential_names) + 1}")
+           return potential_names[:count]
+
+       # Fallback to proper day names
+       default_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+       return default_days[:count] if count <= 7 else [f"Day {i+1}" for i in range(count)]
    
    @classmethod
    def extract_comprehensive_workout_info(cls, text: str) -> Dict[str, Any]:
@@ -616,7 +681,11 @@ class FlexibleConversationState:
            days_keywords = ['day', 'days', 'workout', 'week', 'time']
            is_days_input = any(keyword in user_input.lower() for keyword in days_keywords)
 
-           if not is_days_input and user_input.strip() and len(user_input.strip()) > 2:
+           # Check for "nothing" type responses that should use defaults
+           nothing_keywords = ['nothing', 'no', 'skip', 'default', 'defaults', 'normal', 'standard', 'none', 'nope', 'nah']
+           is_nothing_response = user_input.strip().lower() in nothing_keywords
+
+           if not is_days_input and (user_input.strip() == "" or len(user_input.strip()) > 2 or is_nothing_response):
                return FlexibleConversationState.STATES["DRAFT_GENERATION"]
            return current_state  # Stay and wait for proper workout names
           
@@ -671,10 +740,10 @@ class SmartResponseGenerator:
             ],
       
        "ASK_NAMES": [
-            "What do you want to name your workout days? You can say 'Monday, Tuesday', use muscle groups like 'Push, Pull, Legs', or make your own names — or say nothing to use default names.",
-            "How should I name your workouts? Use normal day names, muscle groups, or any names you like — or say nothing to use default names.",
-            "Time to name your workouts! You can keep it simple with days of the week, use body parts like 'Chest, Back, Legs', or make fun custom names — or say nothing to use default names.",
-            "What names do you prefer for your workouts? Days of the week, muscle groups, or your own creative names are all fine — or say nothing to use default names."
+            "What do you want to name your workout days? You can say 'Monday, Tuesday', use muscle groups like 'Push, Pull, Legs', or make your own names — or say 'nothing' or 'default' to use standard day names.",
+            "How should I name your workouts? Use normal day names, muscle groups, or any names you like — or say 'skip' or 'default' to use standard day names.",
+            "Time to name your workouts! You can keep it simple with days of the week, use body parts like 'Chest, Back, Legs', or make fun custom names — or say 'nothing' to use standard day names.",
+            "What names do you prefer for your workouts? Days of the week, muscle groups, or your own creative names are all fine — or say 'default' to use standard day names."
             ],
       
        "EDIT_DECISION": [
@@ -1199,7 +1268,7 @@ async def ultra_flexible_workout_stream(
                 "template_markdown": md,
                 "template_json": new_tpl,
                 "template_ids": tpl_ids,
-                "message": _format_template_for_display(new_tpl),  # ADD THIS LINE
+                "message": _format_template_for_display(new_tpl),  
                 "summary": summary or "Made those changes for you!"
             })
             
@@ -1277,7 +1346,7 @@ async def ultra_flexible_workout_stream(
                yield _evt({
                    "type": "workout_template",
                    "status": "done",
-                   "message": "Perfect! Your personalized workout is ready. You can say 'show my template' anytime to view it, or 'edit template' to make changes. What would you like to do next?"
+                   "message": "Perfect! Your personalized workout is ready now."
                })
            else:
                yield _evt({
@@ -1595,16 +1664,23 @@ async def ultra_flexible_workout_stream(
                if tpl and 'days' in tpl and template_names:
                     new_days = {}
                     old_keys = list(tpl['days'].keys())
-                    
+
                     for i, template_name in enumerate(template_names):
                         if i < len(old_keys):
                             old_key = old_keys[i]
                             # Use the custom name as the day key (lowercase)
                             new_key = template_name.lower().replace(' ', '_')
-                            new_days[new_key] = tpl['days'][old_key]
-                            # Keep the original title from LLM
-                            # Don't overwrite with day names
-                        
+                            new_days[new_key] = tpl['days'][old_key].copy()
+
+                            # CRITICAL FIX: Update the title to show custom day name
+                            original_title = new_days[new_key].get('title', '')
+                            if original_title and original_title.lower() != template_name.lower():
+                                # Combine custom name with muscle focus if available
+                                new_days[new_key]['title'] = f"{template_name} — {original_title}"
+                            else:
+                                # Just use the custom name
+                                new_days[new_key]['title'] = template_name
+
                     tpl['days'] = new_days
                md = render_markdown_from_template(tpl)
                tpl_ids = build_id_only_structure(tpl)
@@ -1621,7 +1697,7 @@ async def ultra_flexible_workout_stream(
                     "template_markdown": md,
                     "template_json": tpl,
                     "template_ids": tpl_ids,
-                    "message": _format_template_for_display(tpl),  # ADD THIS LINE
+                    "message": _format_template_for_display(tpl), 
                     "why": why or "Tailored specifically for your fitness journey!"
                 })
               
@@ -1838,7 +1914,11 @@ class ConversationLogger:
         days_keywords = ['day', 'days', 'workout', 'week', 'time']
         is_days_input = any(keyword in user_input.lower() for keyword in days_keywords)
 
-        if not is_days_input and user_input.strip() and len(user_input.strip()) > 2:
+        # Check for "nothing" type responses that should use defaults
+        nothing_keywords = ['nothing', 'no', 'skip', 'default', 'defaults', 'normal', 'standard', 'none', 'nope', 'nah']
+        is_nothing_response = user_input.strip().lower() in nothing_keywords
+
+        if not is_days_input and (user_input.strip() == "" or len(user_input.strip()) > 2 or is_nothing_response):
             return FlexibleConversationState.STATES["DRAFT_GENERATION"]
         return current_state  # Stay and wait for proper workout names
         
