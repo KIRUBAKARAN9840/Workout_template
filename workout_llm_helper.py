@@ -297,6 +297,8 @@ class SmartWorkoutEditor:
             'target_day': None,
             'new_title': None
         }
+
+        print(f"🔍 Analyzing title change for: '{user_input}'")  # Debug log
         
         # Enhanced title change patterns
         title_patterns = [
@@ -306,6 +308,12 @@ class SmartWorkoutEditor:
             r'(\w+day)\s+(?:to|as)\s+(.+)',                   # "tuesday to/as something"
             r'change\s+(\w+)\s+(?:to|as)\s+(.+)',             # "change tuesday as mooonday"
             r'make\s+(\w+day)\s+(?:called|named)\s+(.+)',     # "make tuesday called something"
+            # NEW: Handle "day 1", "day 2", etc. patterns
+            r'change\s+day\s*(\d+)\s+(?:to|as)\s+(.+)',       # "change day 1 as monster"
+            r'rename\s+day\s*(\d+)\s+(?:to|as)\s+(.+)',       # "rename day 1 to monster"
+            r'call\s+day\s*(\d+)\s+(.+)',                     # "call day 1 monster"
+            r'day\s*(\d+)\s+(?:to|as)\s+(.+)',                # "day 1 as monster"
+            r'make\s+day\s*(\d+)\s+(?:called|named)\s+(.+)',  # "make day 1 called monster"
         ]
         
         for pattern in title_patterns:
@@ -313,30 +321,61 @@ class SmartWorkoutEditor:
             if match:
                 target_day = match.group(1)
                 new_title = match.group(2).strip()
-                
-                # Validate that target_day looks like a day
+                print(f"🎯 Pattern matched: '{pattern}' -> target_day: '{target_day}', new_title: '{new_title}'")
+
+                # Validate that target_day looks like a day or day number
                 day_keywords = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
                             'mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun']
-                
-                if any(day_key in target_day for day_key in day_keywords):
+
+                # Check if it's a regular day name or a day number (1-7)
+                is_valid_day = (any(day_key in target_day for day_key in day_keywords) or
+                               (target_day.isdigit() and 1 <= int(target_day) <= 7))
+
+                print(f"🔍 Day validation: target_day='{target_day}', is_valid={is_valid_day}")
+
+                if is_valid_day:
                     result['wants_title_change'] = True
                     result['target_day'] = target_day
                     result['new_title'] = new_title.title()
+                    print(f"✅ Title change detected: {result}")
                     break
+
+        print(f"🔍 Final result: {result}")  # Debug log
         
         return result
     @classmethod
     def apply_title_change(cls, template: dict, target_day: str, new_title: str) -> Tuple[dict, str]:
         """Apply day name change - changes both the day key and the display title"""
+        print(f"🔄 Applying title change: target_day='{target_day}', new_title='{new_title}'")
         updated = template.copy()
         days = updated.get('days', {})
+        print(f"🔍 Current days in template: {list(days.keys())}")
 
         # Find the actual day key in the template
         matching_day_key = None
-        for day_key in days.keys():
-            if target_day.lower() in day_key.lower() or day_key.lower() in target_day.lower():
-                matching_day_key = day_key
-                break
+
+        # Handle day numbers (1, 2, 3, etc.)
+        if target_day.isdigit():
+            day_number = int(target_day)
+            day_keys = list(days.keys())
+            print(f"🔢 Day number {day_number}, available days: {day_keys}")
+            if 1 <= day_number <= len(day_keys):
+                matching_day_key = day_keys[day_number - 1]  # Convert to 0-based index
+                print(f"✅ Found day by number: {matching_day_key}")
+            else:
+                print(f"❌ Day number {day_number} out of range (1-{len(day_keys)})")
+        else:
+            # Handle day names (monday, tuesday, etc.)
+            print(f"🔤 Looking for day name: '{target_day}'")
+            for day_key in days.keys():
+                if target_day.lower() in day_key.lower() or day_key.lower() in target_day.lower():
+                    matching_day_key = day_key
+                    print(f"✅ Found day by name: {matching_day_key}")
+                    break
+            if not matching_day_key:
+                print(f"❌ No matching day found for '{target_day}'")
+
+        print(f"🎯 Final matching_day_key: {matching_day_key}")
 
         if matching_day_key and matching_day_key in days:
             # Get the day data and update the title
@@ -1481,6 +1520,7 @@ def handle_specific_exercise_addition(template: Dict[str,Any], instruction: str,
     return updated, f"Added '{exercise_name}' to {target_day_key.title()} ({len(current_exercises)} exercises total)."
 def apply_manual_edit(template: Dict[str,Any], instruction: str, db: Session) -> Tuple[Dict[str,Any], str]:
     """UNIVERSAL: Handle alternatives for ANY exercise in database"""
+    import re  # Ensure re is available in this function scope
     instruction_lower = instruction.lower()
     updated = template.copy()
     
@@ -2048,6 +2088,7 @@ def handle_remove_exercise(template: Dict[str, Any], instruction: str, instructi
 
 def enhanced_edit_template(oai, model: str, template: Dict[str,Any], instruction: str, profile_hint: Dict[str,Any], db: Session) -> Tuple[Dict[str,Any], str]:
     """Enhanced edit with support for bulk operations and flexible requests"""
+    import re  # Ensure re is available in this function scope
     original_days = list(template.get("days", {}).keys())
     instruction_lower = instruction.lower()
     
@@ -2270,7 +2311,20 @@ def enhanced_edit_template(oai, model: str, template: Dict[str,Any], instruction
         result = enforce_exercise_limits(result, respect_user_intent=True)
         return result, summary
 
-    # CRITICAL FIX: Check for alternative/alternate/replacement requests (lower priority than removal)
+    # PRIORITY 1: Title change handling - check this BEFORE replacement keywords
+    title_analysis = SmartWorkoutEditor.analyze_title_change(instruction)
+    if title_analysis['wants_title_change']:
+        print(f"🔄 Detected title change request: {title_analysis}")
+        result, summary = SmartWorkoutEditor.apply_title_change(
+            template,
+            title_analysis['target_day'],
+            title_analysis['new_title']
+        )
+        # Apply exercise limits enforcement
+        result = enforce_exercise_limits(result, respect_user_intent=True)
+        return result, summary
+
+    # PRIORITY 2: Check for alternative/alternate/replacement requests (after title changes)
     replacement_keywords = ["alternate", "alternative", "replace", "change", "swap", "substitute", "different exercise", "something else"]
     print(f"🔍 Checking replacement keywords in '{instruction_lower}': {[kw for kw in replacement_keywords if kw in instruction_lower]}")
     if any(keyword in instruction_lower for keyword in replacement_keywords):
@@ -2283,19 +2337,6 @@ def enhanced_edit_template(oai, model: str, template: Dict[str,Any], instruction
             return result, summary
 
         # Apply exercise limits enforcement only for non-removal operations
-        result = enforce_exercise_limits(result, respect_user_intent=True)
-        return result, summary
-    
-    # Title change handling (existing logic)
-    title_analysis = SmartWorkoutEditor.analyze_title_change(instruction)
-    if title_analysis['wants_title_change']:
-        print(f"🔄 Detected title change request: {title_analysis}")
-        result, summary = SmartWorkoutEditor.apply_title_change(
-            template,
-            title_analysis['target_day'],
-            title_analysis['new_title']
-        )
-        # Apply exercise limits enforcement
         result = enforce_exercise_limits(result, respect_user_intent=True)
         return result, summary
     
