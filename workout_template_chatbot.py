@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_llm_helper import enhanced_edit_template
 from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_llm_helper import SmartWorkoutEditor
 from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_llm_helper import extract_bulk_operation_info
+from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_structured import StructurizeAndSaveRequest, structurize_and_save
 
 from app.models.deps import get_mem, get_oai
 from app.models.database import get_db
@@ -27,49 +28,97 @@ from app.models.fittbot_models import Client, WeightJourney, WorkoutTemplate
 
 
 def _format_template_for_display(template: dict) -> str:
-    """Format template for frontend display - includes day names and muscle focus"""
+    """Format template for frontend display with enhanced styling and emojis"""
     if not template or not template.get('days'):
-        return "No workout data available"
+        return "❌ No workout data available"
 
     formatted_lines = []
     day_count = 1
+
+    # Add attractive header
+    formatted_lines.append("💪 YOUR WORKOUT TEMPLATE 💪")
+    formatted_lines.append("═" * 40)
+    formatted_lines.append("")
 
     for day_key, day_data in template['days'].items():
         if not isinstance(day_data, dict):
             continue
 
-        # Get the title from the template data (which should include custom names)
+        # Get the title from the template data
         title = day_data.get('title', '')
 
-        # Create comprehensive day header
+        # Create comprehensive day header with emojis
+        day_emoji = _get_day_emoji(day_count)
+
         if title:
-            # Use the custom title which may include custom day names like "Monster Day — Upper Body"
+            # Use the custom title which may include custom day names
             if "—" in title or ":" in title:
-                # Title already has custom formatting, just add day number
-                combined_title = f"**Day {day_count}: {title}**"
+                combined_title = f"{day_emoji} Day {day_count}: {title} {day_emoji}"
             else:
-                # Simple title, combine with day number
-                combined_title = f"**Day {day_count}: {title}**"
+                combined_title = f"{day_emoji} Day {day_count}: {title} {day_emoji}"
         else:
             # Fallback to cleaned up key name
-            combined_title = f"**Day {day_count}: {day_key.replace('_', ' ').title()}**"
+            clean_title = day_key.replace('_', ' ').title()
+            combined_title = f"{day_emoji} Day {day_count}: {clean_title} {day_emoji}"
 
         formatted_lines.append(combined_title)
-        formatted_lines.append("")  # Empty line
+        formatted_lines.append("─" * (len(combined_title) - 4))  # Adjust for emoji length
+        formatted_lines.append("")
 
-        # Add exercises
+        # Add exercises with better formatting
         exercises = day_data.get('exercises', [])
-        for i, exercise in enumerate(exercises, 1):
-            if isinstance(exercise, dict):
-                name = exercise.get('name', 'Unknown Exercise')
-                sets = exercise.get('sets', 0)
-                reps = exercise.get('reps', 0)
-                formatted_lines.append(f"{i}. {name} - {sets} sets x {reps} reps")
+        if exercises:
+            for i, exercise in enumerate(exercises, 1):
+                if isinstance(exercise, dict):
+                    name = exercise.get('name', 'Unknown Exercise')
+                    sets = exercise.get('sets', 0)
+                    reps = exercise.get('reps', 0)
+                    exercise_emoji = _get_exercise_emoji(name)
+                    formatted_lines.append(f"   {exercise_emoji} {i}. {name}")
+                    formatted_lines.append(f"      📊 {sets} sets × {reps} reps")
+                    formatted_lines.append("")
+        else:
+            formatted_lines.append("   ⚠️ No exercises added yet")
+            formatted_lines.append("")
 
-        formatted_lines.append("")  # Empty line between days
+        formatted_lines.append("") # Extra space between days
         day_count += 1
 
+    formatted_lines.append("═" * 40)
+    formatted_lines.append("🎯 Ready to crush your goals! 🎯")
+
     return "\n".join(formatted_lines)
+
+def _get_day_emoji(day_num: int) -> str:
+    """Get emoji based on day number"""
+    day_emojis = {
+        1: "🔥", 2: "💥", 3: "⚡", 4: "🚀",
+        5: "💪", 6: "🎯", 7: "🌟"
+    }
+    return day_emojis.get(day_num, "💫")
+
+def _get_exercise_emoji(exercise_name: str) -> str:
+    """Get relevant emoji based on exercise type"""
+    exercise_name_lower = exercise_name.lower()
+
+    if any(word in exercise_name_lower for word in ['squat', 'leg', 'deadlift', 'lunge']):
+        return "🦵"
+    elif any(word in exercise_name_lower for word in ['bench', 'press', 'chest', 'push']):
+        return "💪"
+    elif any(word in exercise_name_lower for word in ['pull', 'row', 'lat', 'back']):
+        return "🎣"
+    elif any(word in exercise_name_lower for word in ['shoulder', 'overhead', 'lateral']):
+        return "🤲"
+    elif any(word in exercise_name_lower for word in ['curl', 'bicep', 'arm']):
+        return "💪"
+    elif any(word in exercise_name_lower for word in ['tricep', 'dip', 'extension']):
+        return "💥"
+    elif any(word in exercise_name_lower for word in ['core', 'plank', 'abs', 'crunch']):
+        return "🔥"
+    elif any(word in exercise_name_lower for word in ['cardio', 'run', 'bike', 'treadmill']):
+        return "🏃"
+    else:
+        return "🏋️"
 router = APIRouter(prefix="/workout_template", tags=["workout_template"])
 # ═══════════════════════════════════════════════════════════════
 # ENHANCED FLEXIBLE NATURAL LANGUAGE PROCESSING
@@ -967,12 +1016,12 @@ async def ultra_flexible_workout_stream(
                    "template_markdown": md,
                    "template_json": tpl,
                    "template_ids": tpl_ids,
-                   "message": "Here's your saved workout template!"
+                   "message": "🎉 Here's your saved workout template! 🎉"
                })
                yield _evt({
                    "type": "workout_template",
                    "status": "hint",
-                   "message": "Want to edit something? Just tell me what to change, or say 'create new template' to start fresh. I'm here to help with whatever you need!"
+                   "message": "✨ Want to customize your workout?\n\n🔧 Tell me what to change (e.g., 'add more chest exercises')\n🆕 Say 'create new template' to start fresh\n💬 I'm here to help with whatever you need!"
                })
                yield "event: done\ndata: [DONE]\n\n"
            return StreamingResponse(_show_saved(), media_type="text/event-stream",
@@ -982,7 +1031,7 @@ async def ultra_flexible_workout_stream(
                yield _evt({
                    "type": "workout_template",
                    "status": "hint",
-                   "message": "No saved template found yet. Want me to create one? Just say something like 'make me a workout plan' or 'create template' and we'll get started!"
+                   "message": "🎯 Ready to create your first workout template?\n\n💪 Say 'make me a workout plan' or 'create template'\n🚀 Let's build something amazing together!\n\n✨ I'll guide you through every step!"
                })
                yield "event: done\ndata: [DONE]\n\n"
            return StreamingResponse(_no_template(), media_type="text/event-stream",
@@ -1052,7 +1101,7 @@ async def ultra_flexible_workout_stream(
            yield _evt({
                "type": "workout_template",
                "status": "ask_names",
-               "message": f"Perfect - {days_count} workout days it is! " + SmartResponseGenerator.get_contextual_prompt("ASK_NAMES")
+               "message": f"🎯 Perfect - {days_count} workout days it is! 🎯\n\n" + SmartResponseGenerator.get_contextual_prompt("ASK_NAMES")
            })
            yield "event: done\ndata: [DONE]\n\n"
           
@@ -1237,7 +1286,7 @@ async def ultra_flexible_workout_stream(
                 yield _evt({
                     "type": "workout_template",
                     "status": "hint",
-                    "message": "I need a template to edit first! Say 'create template' to make a new one, or 'show template' if you have one saved."
+                    "message": "🎯 I need a template to edit first!\n\n🆕 Say 'create template' to make a new one\n📋 Say 'show template' if you have one saved\n💪 Let's get your workout ready!"
                 })
                 yield "event: done\ndata: [DONE]\n\n"
             return StreamingResponse(_need_template(), media_type="text/event-stream",
@@ -1283,7 +1332,7 @@ async def ultra_flexible_workout_stream(
             yield _evt({
                 "type": "workout_template",
                 "status": "error",
-                "message": "Had trouble applying that change. Can you try describing it differently?"
+                "message": "🤔 Had trouble applying that change.\n\n💡 Can you try describing it differently?\n✨ I'm here to help make it perfect!"
             })
         
         yield "event: done\ndata: [DONE]\n\n"
@@ -1325,12 +1374,10 @@ async def ultra_flexible_workout_stream(
            success = await _store_template(mem, db, user_id, tpl, template_name)
           
            if success:
-               # Call structurize endpoint
+               # Call structurize function directly
                try:
-                   import httpx
-                   STRUCT_URL = "http://localhost:8000/workout_template/structurize_and_save"
-                   async with httpx.AsyncClient(timeout=20) as client:
-                       await client.post(STRUCT_URL, json={"client_id": user_id, "template": tpl})
+                   request_data = StructurizeAndSaveRequest(client_id=user_id, template=tpl)
+                   await structurize_and_save(request_data, db)
                except Exception as e:
                    print("structurize_and_save failed:", e)
               
@@ -1340,19 +1387,19 @@ async def ultra_flexible_workout_stream(
                    "type": "workout_template",
                    "status": "stored",
                    "template_name": template_name,
-                   "info": "Your workout template has been saved successfully!"
+                   "info": "🎉 Your workout template has been saved successfully! 🎉"
                })
               
                yield _evt({
                    "type": "workout_template",
                    "status": "done",
-                   "message": "Perfect! Your personalized workout is ready now."
+                   "message": "🏆 Perfect! Your personalized workout is ready now! 🏆\n\n💪 Time to crush those fitness goals!\n🎯 Your template is saved and ready to use anytime!"
                })
            else:
                yield _evt({
                    "type": "workout_template",
                    "status": "error",
-                   "message": "Sorry, couldn't save the template right now. Want to try again? Just say 'save it' once more!"
+                   "message": "⚠️ Oops! Couldn't save the template right now.\n\n🔄 Want to try again? Just say 'save it' once more!\n💬 I'm here to help you get this sorted!"
                })
           
            yield "event: done\ndata: [DONE]\n\n"
@@ -1521,10 +1568,8 @@ async def ultra_flexible_workout_stream(
             
             if success:
                 try:
-                    import httpx
-                    STRUCT_URL = "http://localhost:8000/workout_template/structurize_and_save"
-                    async with httpx.AsyncClient(timeout=20) as client:
-                        await client.post(STRUCT_URL, json={"client_id": user_id, "template": tpl})
+                    request_data = StructurizeAndSaveRequest(client_id=user_id, template=tpl)
+                    await structurize_and_save(request_data, db)
                 except Exception as e:
                     print("structurize_and_save failed:", e)
                 
@@ -1534,13 +1579,13 @@ async def ultra_flexible_workout_stream(
                     "type": "workout_template",
                     "status": "stored",
                     "template_name": template_name,
-                    "info": "Awesome! Your workout template is now saved and ready to use!"
+                    "info": "🎉 Awesome! Your workout template is now saved and ready to use! 🎉"
                 })
                 
                 yield _evt({
                     "type": "workout_template",
                     "status": "done",
-                    "message": "All set! You can view your template anytime by saying 'show my template', or create variations with 'edit template'. What else can I help you with?"
+                    "message": "🎯 All set! Your workout is ready to rock! 🎯\n\n📋 Say 'show my template' to view it anytime\n✏️ Say 'edit template' to create variations\n💬 What else can I help you with?"
                 })
             else:
                 yield _evt({
