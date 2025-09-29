@@ -1,10 +1,297 @@
 from __future__ import annotations
 import orjson, json
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple, List, Optional
 from sqlalchemy.orm import Session
 from .exercise_catalog_db import load_catalog, id_for_name, pick_from_muscles
 import copy
 import re
+
+
+class AIConversationManager:
+    """AI-powered conversation manager for natural workout template creation"""
+
+    @staticmethod
+    def analyze_user_intent(oai, model: str, user_input: str, conversation_context: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Use AI to understand user intent naturally, handling typos and variations"""
+        context = conversation_context or {}
+
+        system_prompt = """You are an AI assistant helping users create workout templates. Analyze the user's input and determine their intent.
+
+Available intents:
+- "create": User wants to create a new workout template
+- "show": User wants to see their existing template
+- "edit": User wants to modify their template
+- "save": User wants to save their template
+- "yes": User is agreeing/confirming something
+- "no": User is disagreeing/declining something
+- "specify_days": User is specifying number of workout days
+- "specify_names": User is providing day names/titles
+- "ask_question": User is asking a question
+- "unclear": Intent is unclear
+
+Additional information to extract:
+- days_count: If user mentions number of days (1-7)
+- day_names: If user provides specific day names
+- muscle_groups: Any muscle groups mentioned
+- positive_sentiment: true/false if response seems positive
+- negative_sentiment: true/false if response seems negative
+- exercise_requests: Any specific exercises mentioned
+
+Handle typos, variations, and natural language. Be flexible and understanding.
+
+Respond in JSON format with: intent, confidence (0-1), days_count, day_names (array), muscle_groups (array), positive_sentiment, negative_sentiment, exercise_requests (array), reasoning"""
+
+        user_prompt = f"""User input: "{user_input}"
+
+Context:
+Current conversation state: {context.get('state', 'unknown')}
+Has existing template: {bool(context.get('template'))}
+Profile info: {context.get('profile', {})}
+
+Analyze this input and determine what the user wants to do."""
+
+        try:
+            resp = oai.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.1
+            )
+
+            result = json.loads(resp.choices[0].message.content or "{}")
+
+            # Ensure all expected fields are present
+            return {
+                "intent": result.get("intent", "unclear"),
+                "confidence": float(result.get("confidence", 0.0)),
+                "days_count": result.get("days_count"),
+                "day_names": result.get("day_names", []),
+                "muscle_groups": result.get("muscle_groups", []),
+                "positive_sentiment": result.get("positive_sentiment", False),
+                "negative_sentiment": result.get("negative_sentiment", False),
+                "exercise_requests": result.get("exercise_requests", []),
+                "reasoning": result.get("reasoning", "")
+            }
+        except Exception as e:
+            print(f"AI intent analysis failed: {e}")
+            # Fallback to basic analysis
+            return {
+                "intent": "unclear",
+                "confidence": 0.0,
+                "days_count": None,
+                "day_names": [],
+                "muscle_groups": [],
+                "positive_sentiment": False,
+                "negative_sentiment": False,
+                "exercise_requests": [],
+                "reasoning": f"Failed to analyze: {e}"
+            }
+
+    @staticmethod
+    def determine_conversation_flow(oai, model: str, user_input: str, current_state: str, context: Dict[str, Any]) -> Dict[str, Any]:
+        """AI-powered conversation flow determination"""
+
+        system_prompt = """You are managing a workout template creation conversation. Based on the user input and current context, determine what should happen next.
+
+Available states:
+- "FETCH_PROFILE": Get user's fitness profile and show it to them
+- "PROFILE_CONFIRMATION": Show profile and ask for confirmation
+- "ASK_DAYS": Ask how many workout days per week
+- "ASK_NAMES": Ask for day names/titles
+- "DRAFT_GENERATION": Create the workout template
+- "SHOW_TEMPLATE": Display the current template
+- "EDIT_DECISION": Ask if user wants to edit
+- "APPLY_EDIT": Apply user's edit request
+- "CONFIRM_SAVE": Ask to confirm saving
+- "DONE": Conversation complete
+- "STAY": Stay in current state, ask for clarification
+
+IMPORTANT FLOW RULES:
+1. For initial greetings ("Hi", "Hello"), always go to "START" to show profile immediately
+2. If user says "yes", "create", "workout" after seeing profile, proceed to workout creation flow
+3. START state should show the user's existing profile and ask for preferences
+4. Always prioritize showing existing profile data first before asking questions
+5. After profile confirmation, proceed directly to workout days/template creation
+
+Also determine:
+- should_proceed: true/false if we have enough info to move forward
+- response_message: What to tell the user
+- extracted_info: Any specific information extracted from input
+
+Be flexible with user responses. Handle typos, variations, and natural speech patterns."""
+
+        user_prompt = f"""Current state: {current_state}
+User input: "{user_input}"
+
+Context:
+- Has profile: {bool(context.get('profile'))}
+- Has template: {bool(context.get('template'))}
+- Profile: {context.get('profile', {})}
+- Template exists: {bool(context.get('template', {}).get('days'))}
+
+IMPORTANT:
+- If user says "Hi", "Hello", etc., go to "START" to show profile immediately
+- If current state is "start" and user shows interest (says "yes", "create", etc.), proceed to workout creation
+- Always show profile data first before asking for workout preferences
+
+What should happen next? Respond in JSON format with next_state, should_proceed, response_message, extracted_info."""
+
+        try:
+            resp = oai.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.1
+            )
+
+            content = resp.choices[0].message.content or ""
+            print(f"🔍 AI Flow Raw Response: {content}")
+
+            # Try to parse JSON, with fallbacks
+            try:
+                result = json.loads(content)
+            except json.JSONDecodeError:
+                # If not valid JSON, try to extract JSON from the response
+                import re
+                json_match = re.search(r'\{.*\}', content, re.DOTALL)
+                if json_match:
+                    try:
+                        result = json.loads(json_match.group())
+                    except:
+                        result = {}
+                else:
+                    result = {}
+
+            return {
+                "next_state": result.get("next_state", "STAY"),
+                "should_proceed": result.get("should_proceed", True),
+                "response_message": result.get("response_message", "I'm not sure what you mean. Could you clarify?"),
+                "extracted_info": result.get("extracted_info", {})
+            }
+        except Exception as e:
+            print(f"🚨 AI Flow Error: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "next_state": "STAY",
+                "should_proceed": False,
+                "response_message": f"I'm having trouble understanding. Could you try rephrasing? (Error: {e})",
+                "extracted_info": {}
+            }
+
+    @staticmethod
+    def validate_and_map_exercises(oai, model: str, user_request: str, db: Session) -> Dict[str, Any]:
+        """AI-powered exercise validation - ensures only database exercises are used"""
+
+        # Load exercise catalog
+        catalog = load_catalog(db)
+        available_exercises = []
+        for exercise_id, exercise_data in catalog["by_id"].items():
+            available_exercises.append({
+                "id": exercise_id,
+                "name": exercise_data["name"],
+                "muscle_group": exercise_data["muscle_group"],
+                "isCardio": exercise_data["isCardio"],
+                "isBodyWeight": exercise_data["isBodyWeight"]
+            })
+
+        system_prompt = """You are helping map user exercise requests to available exercises in our database.
+
+CRITICAL RULES:
+1. ONLY use exercises from the provided database list
+2. If user requests an exercise not in database, find the closest alternative from database
+3. If no suitable alternative exists, explain this to the user
+4. Never invent or create new exercises
+
+For each requested exercise, provide:
+- database_id: The exact ID from our database (must exist)
+- database_name: The exact name from database
+- user_requested: What the user originally asked for
+- is_match: true if exact match, false if alternative
+- explanation: Brief explanation if using alternative
+
+Respond in JSON format with an array of exercise mappings."""
+
+        exercises_list = json.dumps(available_exercises, indent=2)
+
+        user_prompt = f"""User request: "{user_request}"
+
+Available exercises in database:
+{exercises_list}
+
+Map the user's request to valid database exercises only. If they ask for something not available, find the best alternatives from the database."""
+
+        try:
+            resp = oai.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.1
+            )
+
+            result = json.loads(resp.choices[0].message.content or "{}")
+            return {
+                "exercise_mappings": result.get("exercise_mappings", []),
+                "success": True,
+                "message": "Exercise mapping completed"
+            }
+
+        except Exception as e:
+            print(f"Exercise validation failed: {e}")
+            return {
+                "exercise_mappings": [],
+                "success": False,
+                "message": f"Failed to validate exercises: {e}"
+            }
+
+    @staticmethod
+    def generate_contextual_response(oai, model: str, conversation_state: str, user_input: str, context: Dict[str, Any]) -> str:
+        """Generate natural, contextual responses for any conversation state"""
+
+        system_prompt = """You are a friendly, encouraging fitness assistant helping users create workout templates.
+
+Generate natural, conversational responses that:
+1. Acknowledge what the user said
+2. Provide clear guidance on next steps
+3. Stay encouraging and positive
+4. Handle typos and unclear input gracefully
+5. Ask clarifying questions when needed
+
+Keep responses concise but warm. Use emojis sparingly and appropriately."""
+
+        context_info = {
+            "state": conversation_state,
+            "has_profile": bool(context.get("profile")),
+            "has_template": bool(context.get("template")),
+            "user_info": context.get("profile", {})
+        }
+
+        user_prompt = f"""Current conversation state: {conversation_state}
+User just said: "{user_input}"
+Context: {json.dumps(context_info)}
+
+Generate an appropriate response for this situation."""
+
+        try:
+            resp = oai.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                temperature=0.3
+            )
+
+            return (resp.choices[0].message.content or "").strip()
+
+        except Exception as e:
+            return "I'm here to help you create a great workout plan! Could you tell me more about what you're looking for?"
 
 
 
@@ -314,6 +601,11 @@ class SmartWorkoutEditor:
             r'call\s+day\s*(\d+)\s+(.+)',                     # "call day 1 monster"
             r'day\s*(\d+)\s+(?:to|as)\s+(.+)',                # "day 1 as monster"
             r'make\s+day\s*(\d+)\s+(?:called|named)\s+(.+)',  # "make day 1 called monster"
+            # Handle "day X name" patterns
+            r'change\s+day\s*(\d+)\s+name\s+(?:to|as)\s+(.+)',  # "change day 1 name as night shift"
+            r'rename\s+day\s*(\d+)\s+name\s+(?:to|as)\s+(.+)',  # "rename day 1 name to night shift"
+            r'call\s+day\s*(\d+)\s+name\s+(.+)',                # "call day 1 name monster"
+            r'day\s*(\d+)\s+name\s+(?:to|as)\s+(.+)',           # "day 1 name as monster"
         ]
         
         for pattern in title_patterns:
@@ -378,21 +670,16 @@ class SmartWorkoutEditor:
         print(f"🎯 Final matching_day_key: {matching_day_key}")
 
         if matching_day_key and matching_day_key in days:
-            # Get the day data and update the title
+            # Get the day data and update ONLY the title (keep the same key)
             day_data = days[matching_day_key].copy()
-            # IMPORTANT: Change the title to the new name - this is what user wants
+
+            # IMPORTANT: Only change the title, keep the same day key
             day_data['title'] = new_title
+            print(f"🎯 Updated title: '{day_data['title']}' for day key: '{matching_day_key}'")
 
-            # Create new day key (lowercase version of new name)
-            new_day_key = new_title.lower().replace(' ', '_')
-
-            # Create new days dict with updated key and updated title
-            new_days = {}
-            for key, value in days.items():
-                if key == matching_day_key:
-                    new_days[new_day_key] = day_data  # Use new key and new title
-                else:
-                    new_days[key] = value
+            # Update the template with the same key but new title
+            new_days = days.copy()
+            new_days[matching_day_key] = day_data  # Same key, updated title
 
             updated['days'] = new_days
             original_title = days[matching_day_key].get('title', matching_day_key.title())
@@ -847,9 +1134,15 @@ def _template_skeleton_dynamic(template_names: list) -> Dict[str,Any]:
     }
 def _enforce_catalog_on_template_db_dynamic(tpl: Dict[str, Any], db: Session, template_names: list) -> Dict[str, Any]:
     """Dynamic version of catalog enforcement with 6-exercise minimum"""
+    print("🔍 DEBUG - Starting catalog enforcement")
     from .exercise_catalog_db import load_catalog, id_for_name, pick_from_muscles
+
+    print("🔍 DEBUG - About to load catalog")
     cat = load_catalog(db)
+    print(f"🔍 DEBUG - Catalog loaded: {type(cat)}, keys: {cat.keys() if cat else 'None'}")
+
     if not cat or "by_id" not in cat:
+        print("🔍 DEBUG - No catalog available, returning original template")
         return tpl
     
     days = tpl.get("days") or {}
@@ -894,8 +1187,11 @@ def _enforce_catalog_on_template_db_dynamic(tpl: Dict[str, Any], db: Session, te
                     "note": ex.get("note"),
                 })
         
-        # ENFORCE 6-EXERCISE MINIMUM
-        while len(normalized_list) < 6:
+        # ENFORCE 6-EXERCISE MINIMUM (with infinite loop protection)
+        attempt_count = 0
+        max_attempts = 20  # Prevent infinite loops
+        while len(normalized_list) < 6 and attempt_count < max_attempts:
+            attempt_count += 1
             picked = pick_from_muscles(muscles or ["full body"], cat, used_ids=global_used.union(day_used), n=1)
             if picked and picked[0] in cat["by_id"]:
                 eid = picked[0]
@@ -926,6 +1222,17 @@ def _enforce_catalog_on_template_db_dynamic(tpl: Dict[str, Any], db: Session, te
                     global_used.add(eid)
                 else:
                     break  # No more exercises available
+
+        # If still not enough exercises, create basic ones
+        if len(normalized_list) < 3:
+            basic_exercises = [
+                {"id": 9999, "name": "Push-ups", "sets": 3, "reps": 10, "note": None},
+                {"id": 9998, "name": "Squats", "sets": 3, "reps": 12, "note": None},
+                {"id": 9997, "name": "Plank", "sets": 3, "reps": "30 seconds", "note": None},
+            ]
+            for basic_ex in basic_exercises:
+                if len(normalized_list) < 6:
+                    normalized_list.append(basic_ex)
         
         # ENFORCE 8-EXERCISE MAXIMUM
         if len(normalized_list) > 8:
@@ -962,19 +1269,27 @@ def generate_system_prompt(template_names: list) -> str:
         "- No markdown, ONLY JSON."
     )
 def llm_generate_template_from_profile(oai, model: str, profile: Dict[str,Any], db: Session) -> Tuple[Dict[str,Any], str]:
+    print("🔍 DEBUG - Entered llm_generate_template_from_profile function")
+
     goal = (profile.get("client_goal") or profile.get("goal") or "muscle gain")
     experience = (profile.get("experience") or "beginner")
     cw = profile.get("current_weight")
     tw = profile.get("target_weight")
     delta_txt = profile.get("weight_delta_text") or ""
-    
+
+    print(f"🔍 DEBUG - Basic profile parsed: goal={goal}, experience={experience}")
+
     # Get template configuration
     template_count = profile.get("template_count", 6)
     template_names = profile.get("template_names", ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday"])
+
+    print(f"🔍 DEBUG - Template config: count={template_count}, names={template_names}")
     
     # Check if this is a muscle-specific template request
     muscle_focus = profile.get("muscle_focus")
-    
+
+    print(f"🔍 DEBUG - Checking muscle focus: {muscle_focus}")
+
     if muscle_focus:
         print(f"🎯 Creating muscle-specific template for: {muscle_focus}")
         muscle_distributions = {muscle_focus: len(template_names)}
@@ -991,6 +1306,8 @@ def llm_generate_template_from_profile(oai, model: str, profile: Dict[str,Any], 
         return SmartWorkoutEditor.create_muscle_specific_template(['monday'], muscle_distributions, db)
     
     # Continue with existing LLM generation for general templates
+    print("🔍 DEBUG - Preparing LLM generation for general templates")
+
     user_prompt = (
         "Build a workout template for this client profile:\n"
         f"- Goal: {goal}\n"
@@ -1003,16 +1320,20 @@ def llm_generate_template_from_profile(oai, model: str, profile: Dict[str,Any], 
         f"Use these exact day keys: {', '.join([name.lower() for name in template_names])}\n"
         "Pick a split that works well with the given template names and training frequency."
     )
-    
+
+    print("🔍 DEBUG - About to call OpenAI API")
+
     try:
         system_prompt = generate_system_prompt(template_names)
+        print("🔍 DEBUG - Generated system prompt successfully")
+
         resp = oai.chat.completions.create(
             model=model,
             messages=[{"role": "system", "content": system_prompt},
                       {"role": "user",   "content": user_prompt}],
-            response_format={"type": "json_object"},
             temperature=0.2,
         )
+        print("🔍 DEBUG - OpenAI API call completed successfully")
         obj = _safe_json(resp.choices[0].message.content or "{}", {
             "template": _template_skeleton_dynamic(template_names),
             "rationale": ""
@@ -1029,11 +1350,18 @@ def llm_generate_template_from_profile(oai, model: str, profile: Dict[str,Any], 
                 tpl["days"].setdefault(day_key, {"title": day_name.title(), "muscle_groups": [], "exercises": []})
         
         tpl.setdefault("name", f"Workout Template ({template_count} days)")
+
+        print("🔍 DEBUG - About to enforce catalog on template")
         # Enforce DB catalog + attach IDs
         tpl = _enforce_catalog_on_template_db_dynamic(tpl, db, template_names)
+        print("🔍 DEBUG - Catalog enforcement completed")
+
         return tpl, rat
-    except Exception:
-        return _template_skeleton_dynamic(template_names), "Fallback skeleton due to generation error."
+    except Exception as e:
+        print(f"🚨 Template generation error: {e}")
+        import traceback
+        traceback.print_exc()
+        return _template_skeleton_dynamic(template_names), f"Fallback skeleton due to generation error: {e}"
 # ───────────────────── LLM: edit template ───────────────────
 EDIT_SYSTEM = (
     "You are modifying an existing workout template. "
