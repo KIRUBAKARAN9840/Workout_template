@@ -1,14 +1,22 @@
 from __future__ import annotations
-import os, orjson, uuid, re, secrets
+import os, orjson, uuid, re, secrets, traceback
 from typing import Dict, Any, Optional, List, Tuple
 from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.responses import StreamingResponse
 from fastapi_limiter.depends import RateLimiter
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_llm_helper import enhanced_edit_template
 from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_llm_helper import SmartWorkoutEditor
 from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_llm_helper import extract_bulk_operation_info
-from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_structured import StructurizeAndSaveRequest, structurize_and_save
+from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_llm_helper import AIConversationManager
+from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_structured import (
+    StructurizeAndSaveRequest,
+    _gather_ids,
+    _fetch_qr_rows,
+    _build_day_payload,
+    _persist_payload
+)
 
 from app.models.deps import get_mem, get_oai
 from app.models.database import get_db
@@ -24,7 +32,130 @@ from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_llm_h
    DAYS6,
    build_id_only_structure,
 )
-from app.models.fittbot_models import Client, WeightJourney, WorkoutTemplate
+from app.models.fittbot_models import Client, WeightJourney, WorkoutTemplate, ClientTarget
+from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.exercise_catalog_db import load_catalog, id_for_name
+
+
+def _generate_unique_day_key(template_name: str, existing_keys: set) -> str:
+    """Generate a unique day key from template name, handling duplicates"""
+    base_key = template_name.lower().replace(' ', '_').replace('-', '_')
+    # Remove any non-alphanumeric characters except underscores
+    base_key = re.sub(r'[^a-z0-9_]', '', base_key)
+
+    if base_key not in existing_keys:
+        return base_key
+
+    # If duplicate, add suffix numbers until unique
+    counter = 2
+    while f"{base_key}_{counter}" in existing_keys:
+        counter += 1
+
+    return f"{base_key}_{counter}"
+
+
+async def _ensure_template_has_ids(template: dict, db: Session) -> dict:
+    """Ensure all exercises in template have valid IDs from the database"""
+    if not template or not template.get('days'):
+        return None
+
+    try:
+        # Load exercise catalog
+        catalog = load_catalog(db)
+        if not catalog:
+            print("⚠️ Could not load exercise catalog")
+            return None
+
+        modified = False
+        template_copy = template.copy()
+        days_copy = template_copy.get('days', {}).copy()
+
+        for day_key, day_data in days_copy.items():
+            if not isinstance(day_data, dict):
+                continue
+
+            exercises = day_data.get('exercises', [])
+            if not isinstance(exercises, list):
+                continue
+
+            updated_exercises = []
+            for exercise in exercises:
+                if not isinstance(exercise, dict):
+                    continue
+
+                # Check if exercise already has a valid ID
+                existing_id = exercise.get('id')
+                if isinstance(existing_id, int) and existing_id > 0:
+                    updated_exercises.append(exercise)
+                    continue
+
+                # Try to find ID by exercise name
+                exercise_name = exercise.get('name', '')
+                if exercise_name:
+                    found_id = id_for_name(exercise_name, catalog)
+                    if found_id:
+                        exercise_copy = exercise.copy()
+                        exercise_copy['id'] = found_id
+                        updated_exercises.append(exercise_copy)
+                        modified = True
+                        print(f"✅ Assigned ID {found_id} to exercise '{exercise_name}'")
+                    else:
+                        print(f"⚠️ Could not find ID for exercise '{exercise_name}'")
+                        # Still add the exercise without ID - it will be filtered out later
+                        updated_exercises.append(exercise)
+                else:
+                    print(f"⚠️ Exercise missing name: {exercise}")
+                    updated_exercises.append(exercise)
+
+            # Update the day's exercises
+            day_data_copy = day_data.copy()
+            day_data_copy['exercises'] = updated_exercises
+            days_copy[day_key] = day_data_copy
+
+        template_copy['days'] = days_copy
+
+        if modified:
+            print(f"✅ Template updated with exercise IDs")
+
+        return template_copy
+
+    except Exception as e:
+        print(f"❌ Error ensuring template has IDs: {e}")
+        return None
+
+
+def _ensure_unique_exercise_ids(template: dict) -> dict:
+    """Ensure all exercise IDs are unique across the entire template"""
+    if not template or not template.get('days'):
+        return template
+
+    used_ids = set()
+    next_id = 1
+
+    # First pass: collect all existing IDs and find the next available ID
+    for day_data in template['days'].values():
+        if isinstance(day_data, dict) and 'exercises' in day_data:
+            for exercise in day_data.get('exercises', []):
+                if isinstance(exercise, dict) and 'id' in exercise:
+                    exercise_id = exercise['id']
+                    if isinstance(exercise_id, int):
+                        used_ids.add(exercise_id)
+                        next_id = max(next_id, exercise_id + 1)
+
+    # Second pass: assign unique IDs to any exercises without IDs or with duplicate IDs
+    for day_data in template['days'].values():
+        if isinstance(day_data, dict) and 'exercises' in day_data:
+            exercises = day_data.get('exercises', [])
+            for exercise in exercises:
+                if isinstance(exercise, dict):
+                    if 'id' not in exercise or exercise['id'] in used_ids:
+                        # Find next available ID
+                        while next_id in used_ids:
+                            next_id += 1
+                        exercise['id'] = next_id
+                        used_ids.add(next_id)
+                        next_id += 1
+
+    return template
 
 
 def _format_template_for_display(template: dict) -> str:
@@ -604,7 +735,7 @@ class UltraFlexibleParser:
         text = text.lower().strip()
         
         # Explicit save commands should be treated as positive for saving context
-        save_commands = ['save', 'save it', 'store', 'store it', 'keep', 'keep it']
+        save_commands = ['save', 'save it', 'store', 'store it', 'keep', 'keep it', 'finalize', 'done']
         if text in save_commands:
             return True
             
@@ -682,6 +813,7 @@ class FlexibleConversationState:
    STATES = {
        "START": "start",
        "FETCH_PROFILE": "fetch_profile",
+       "PROFILE_CONFIRMATION": "profile_confirmation",
        "ASK_DAYS": "ask_days",
        "ASK_NAMES": "ask_names",
        "DRAFT_GENERATION": "draft_generation",
@@ -744,7 +876,9 @@ class FlexibleConversationState:
           
        elif current_state == FlexibleConversationState.STATES["EDIT_DECISION"]:
         # Check for explicit save commands first
-        save_commands = ['save', 'save it', 'store', 'store it', 'keep', 'keep it', 'perfect', 'looks good', 'good to go']
+        save_commands = ['save', 'save it', 'store', 'store it', 'keep', 'keep it', 'perfect', 'looks good', 'good to go',
+                        'finalize', 'finalize it', 'done', 'ready', 'confirm', 'approved', 'accept', 'yes save',
+                        'save template', 'save plan', 'save workout', 'this is good', 'looks great', 'all set']
         if any(cmd in user_input.lower() for cmd in save_commands):
             return FlexibleConversationState.STATES["CONFIRM_SAVE"]
         elif UltraFlexibleParser.is_positive_response(user_input) or user_intent == "edit":
@@ -849,50 +983,80 @@ def _evt(payload: Dict[str, Any]) -> str:
    }
    print(f"🚀 Backend event: {payload.get('type', 'unknown')} - {payload.get('status', 'no-status')}")
    return sse_json(payload)
-def _fetch_profile(db: Session, client_id: int) -> Dict[str, Any]:
-   """Enhanced profile fetching with fallbacks"""
+def _fetch_profile(db: Session, client_id: int):
+   """Fetch complete client profile including weight journey and calorie targets"""
    try:
+       # Get latest weight journey
        w = (
            db.query(WeightJourney)
            .where(WeightJourney.client_id == client_id)
            .order_by(WeightJourney.id.desc())
            .first()
        )
-       current_weight = float(w.actual_weight) if w and w.actual_weight is not None else None
-       target_weight = float(w.target_weight) if w and w.target_weight is not None else None
+
+       current_weight = float(w.actual_weight) if w and w.actual_weight is not None else 70.0
+       target_weight = float(w.target_weight) if w and w.target_weight is not None else 65.0
+
        weight_delta_text = None
+       goal_type = "maintain"
+
        if current_weight is not None and target_weight is not None:
            diff = round(target_weight - current_weight, 1)
            if diff > 0:
                weight_delta_text = f"Gain {abs(diff)} kg (from {current_weight} → {target_weight})"
+               goal_type = "weight_gain"
            elif diff < 0:
                weight_delta_text = f"Lose {abs(diff)} kg (from {current_weight} → {target_weight})"
+               goal_type = "weight_loss"
            else:
                weight_delta_text = f"Maintain {current_weight} kg"
+               goal_type = "maintain"
+
+       # Get client details
        c = db.query(Client).where(Client.client_id == client_id).first()
-       goal = (getattr(c, "goals", None) or getattr(c, "goal", None) or "muscle gain") if c else "muscle gain"
-       experience = (getattr(c, "experience", None) or "beginner") if c else "beginner"
+       client_goal = (getattr(c, "goals", None) or getattr(c, "goal", None) or "muscle gain") if c else "muscle gain"
+       lifestyle= c.lifestyle if c else "moderate"
+
+       # Get calorie target
+       ct = db.query(ClientTarget).where(ClientTarget.client_id == client_id).first()
+       target_calories = float(ct.calories) if ct and ct.calories else 2000.0
+
        return {
+           "client_id": client_id,
            "current_weight": current_weight,
            "target_weight": target_weight,
            "weight_delta_text": weight_delta_text,
-           "client_goal": goal,
-           "experience": experience,
+           "client_goal": client_goal,
+           "goal_type": goal_type,
+           "target_calories": target_calories,
+           "lifestyle": lifestyle,
+           "days_per_week": 6,  # Mon–Sat
+           "experience": "beginner",  # Default for compatibility
            "profile_complete": True
        }
+
    except Exception as e:
-       print(f"Profile fetch error: {e}")
+       print(f"Error fetching profile for client {client_id}: {e}")
+       print(f"Profile fetch traceback: {traceback.format_exc()}")
+       # Return default profile for testing
        return {
-           "current_weight": None,
-           "target_weight": None,
-           "weight_delta_text": None,
-           "client_goal": "muscle gain",
+           "client_id": client_id,
+           "current_weight": 70.0,
+           "target_weight": 65.0,
+           "weight_delta_text": "Lose 5.0 kg (from 70.0 → 65.0)",
+           "client_goal": "weight loss",
+           "goal_type": "weight_loss",
+           "target_calories": 1800.0,
+           "lifestyle": "moderate",
+           "days_per_week": 6,
            "experience": "beginner",
            "profile_complete": False
        }
 async def _store_template(mem, db: Session, client_id: int, template: dict, name: str) -> bool:
    """Enhanced template storage with error handling"""
    try:
+       # Ensure unique exercise IDs before storage
+       template = _ensure_unique_exercise_ids(template)
        id_only = build_id_only_structure(template)
        await mem.r.set(
            f"workout_template:{client_id}",
@@ -935,6 +1099,8 @@ async def _get_saved_template(mem, db: Session, client_id: int) -> Optional[Dict
        if raw:
            obj = orjson.loads(raw)
            if "template" in obj and "template_ids" not in obj:
+               # Ensure unique exercise IDs before building structure
+               obj["template"] = _ensure_unique_exercise_ids(obj["template"])
                obj["template_ids"] = build_id_only_structure(obj["template"])
            return obj
    except Exception as e:
@@ -949,6 +1115,8 @@ async def _get_saved_template(mem, db: Session, client_id: int) -> Optional[Dict
        )
        if rec and getattr(rec, "json", None):
            tpl = orjson.loads(rec.json)
+           # Ensure unique exercise IDs before building structure
+           tpl = _ensure_unique_exercise_ids(tpl)
            return {
                "name": rec.name,
                "template": tpl,
@@ -980,15 +1148,25 @@ async def ultra_flexible_workout_stream(
    current_state = pend.get("state", FlexibleConversationState.STATES["START"])
 
 
-   # Parse user intent with context
-   user_intent, intent_confidence = UltraFlexibleParser.extract_intent(user_input, pend)
+   # Parse user intent with context using AI
+   ai_analysis = AIConversationManager.analyze_user_intent(oai, OPENAI_MODEL, user_input, pend)
+   user_intent = ai_analysis["intent"]
+   intent_confidence = ai_analysis["confidence"]
 
-   # Determine next state
-   next_state = FlexibleConversationState.determine_next_state(
-       current_state, user_input, user_intent, intent_confidence, pend
+   # Use AI to determine conversation flow
+   flow_decision = AIConversationManager.determine_conversation_flow(
+       oai, OPENAI_MODEL, user_input, current_state, pend
    )
+   next_state = flow_decision["next_state"]
   
    print(f"🤖 Ultra-flexible transition: {current_state} → {next_state} (intent: {user_intent}, conf: {intent_confidence:.2f})")
+   print(f"🔍 DEBUG - User input: '{user_input}', Current State: '{current_state}', Next State: '{next_state}'")
+   print(f"🔍 DEBUG - Checking state conditions:")
+   print(f"  - current_state == DRAFT_GENERATION: {current_state == FlexibleConversationState.STATES['DRAFT_GENERATION']}")
+   print(f"  - next_state == 'DRAFT_GENERATION': {next_state == 'DRAFT_GENERATION'}")
+   print(f"  - next_state == 'draft_generation': {next_state == 'draft_generation'}")
+   print(f"  - FlexibleConversationState.STATES['DRAFT_GENERATION']: '{FlexibleConversationState.STATES['DRAFT_GENERATION']}'")
+   print(f"  - Actual next_state value: '{next_state}'")
 
    # Skip processing if no real state change (avoid duplicate processing)
    if current_state == next_state and current_state != FlexibleConversationState.STATES["START"]:
@@ -997,18 +1175,15 @@ async def ultra_flexible_workout_stream(
        return StreamingResponse(_no_change(), media_type="text/event-stream",
                               headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-   # ═══════════════════════════════════════════════════════════════
-   # STATE HANDLERS WITH ULTRA-FLEXIBILITY
-   # ═══════════════════════════════════════════════════════════════
-  
    # SHOW TEMPLATE - Can be accessed from anywhere
-   if next_state == "SHOW_TEMPLATE" or (user_intent == "show" and intent_confidence > 0.25):
+   if next_state == "SHOW_TEMPLATE":
        saved = await _get_saved_template(mem, db, user_id)
-       if saved:
-           tpl = saved.get("template", {})
+
+       if saved and saved.get("template", {}).get("days"):
+           tpl = saved["template"]
            md = render_markdown_from_template(tpl)
-           tpl_ids = saved.get("template_ids", build_id_only_structure(tpl))
-          
+           tpl_ids = saved.get("template_ids") or build_id_only_structure(tpl)
+
            async def _show_saved():
                yield _evt({
                    "type": "workout_template",
@@ -1020,8 +1195,8 @@ async def ultra_flexible_workout_stream(
                })
                yield _evt({
                    "type": "workout_template",
-                   "status": "hint",
-                   "message": "✨ Want to customize your workout?\n\n🔧 Tell me what to change (e.g., 'add more chest exercises')\n🆕 Say 'create new template' to start fresh\n💬 I'm here to help with whatever you need!"
+                   "status": "edit_decision",
+                   "message": "What would you like to do with this template? You can edit it, create a new one, or save changes."
                })
                yield "event: done\ndata: [DONE]\n\n"
            return StreamingResponse(_show_saved(), media_type="text/event-stream",
@@ -1036,242 +1211,426 @@ async def ultra_flexible_workout_stream(
                yield "event: done\ndata: [DONE]\n\n"
            return StreamingResponse(_no_template(), media_type="text/event-stream",
                                   headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-  
-   # FETCH_PROFILE STATE
-   if next_state == FlexibleConversationState.STATES["FETCH_PROFILE"]:
-        import asyncio
-        
-        # Extract comprehensive info from the initial request
-        workout_info = UltraFlexibleParser.extract_comprehensive_workout_info(user_input)
 
-        async def _fetch_and_proceed():
+   # START STATE - Show profile for ANY first message
+   if current_state == FlexibleConversationState.STATES["START"]:
+        async def _start_with_profile():
             prof = _fetch_profile(db, user_id)
-                    
-            # CRITICAL FIX: Only proceed with days info if we actually detected it
-            if workout_info['is_muscle_specific_template'] and workout_info['muscle_focus'] and workout_info['has_days_info']:
-                prof['days_count'] = workout_info['days_count']
-                
-                # Use proper day names instead of "Day 1", "Day 2"
-                if workout_info['days_count'] <= 7:
-                    day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-                    prof['template_names'] = day_names[:workout_info['days_count']]
-                else:
-                    prof['template_names'] = [f"Day {i+1}" for i in range(workout_info['days_count'])]
-                
-                prof['days_per_week'] = workout_info['days_count']
-                prof['muscle_focus'] = workout_info['muscle_focus']
-                
-                # Skip directly to generation with muscle focus
-                await mem.set_pending(user_id, {
-                    "state": FlexibleConversationState.STATES["DRAFT_GENERATION"],
-                    "profile": prof
-                })
-                
-                
-                # ... rest of muscle-specific generation logic
-                
-            else:
-                # FIXED: No days info detected - ask for it
-                await mem.set_pending(user_id, {
-                    "state": FlexibleConversationState.STATES["ASK_DAYS"],
-                    "profile": prof
-                })
+            print(f"🔍 DEBUG - Fetched profile for START state client {user_id}: {prof}")
 
-                yield _evt({
-                    "type": "workout_template",
-                    "status": "ask_days",
-                    "message": SmartResponseGenerator.get_contextual_prompt("ASK_DAYS", {"profile": prof})
-                })
-            
-        return StreamingResponse(_fetch_and_proceed(), media_type="text/event-stream",
+            # Format profile information for display
+            profile_info = []
+            profile_info.append(f"💪 Goal: {prof.get('client_goal', 'muscle gain')}")
+            profile_info.append(f"📈 Experience: {prof.get('experience', 'beginner')}")
+            profile_info.append(f"🏋️ Current Weight: {prof.get('current_weight', 70.0)} kg")
+            profile_info.append(f"🎯 Target Weight: {prof.get('target_weight', 65.0)} kg")
+
+            if prof.get("weight_delta_text"):
+                profile_info.append(f"📊 Progress Goal: {prof['weight_delta_text']}")
+            if prof.get("lifestyle"):
+                profile_info.append(f"🏃 Lifestyle: {prof['lifestyle']}")
+            if prof.get("target_calories"):
+                profile_info.append(f"🔥 Daily Calorie Target: {prof['target_calories']} kcal")
+
+            profile_display = "\n".join(profile_info)
+
+            # Set state to profile confirmation since we're showing profile
+            await mem.set_pending(user_id, {
+                "state": "PROFILE_CONFIRMATION",
+                "profile": prof
+            })
+
+            message = f"Hi! I'm your workout template assistant. Here's your current profile:\n\n{profile_display}\n\nWould you like me to create a workout plan based on this profile, or do you have any specific preferences or changes you'd like to make first?"
+            print(f"🔍 DEBUG - START state message: {message}")
+
+            yield _evt({
+                "type": "workout_template",
+                "status": "profile_shown",
+                "message": message,
+                "profile_data": prof
+            })
+            yield "event: done\ndata: [DONE]\n\n"
+
+        return StreamingResponse(_start_with_profile(), media_type="text/event-stream",
                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-  
-   # ASK_DAYS STATE 
-   elif next_state == FlexibleConversationState.STATES["ASK_NAMES"]:
-       days_count = UltraFlexibleParser.extract_days_count(user_input)
+
+   # FETCH_PROFILE STATE - Show existing profile and ask for confirmation
+   elif next_state == FlexibleConversationState.STATES["FETCH_PROFILE"]:
+        async def _fetch_and_show_profile():
+            prof = _fetch_profile(db, user_id)
+            print(f"🔍 DEBUG - Fetched profile for client {user_id}: {prof}")
+
+            # Format profile information for display
+            profile_info = []
+
+            # Always show goal and experience (they have defaults)
+            profile_info.append(f"💪 Goal: {prof.get('client_goal', 'muscle gain')}")
+            profile_info.append(f"📈 Experience: {prof.get('experience', 'beginner')}")
+
+            # Add weight info - always available now with defaults
+            profile_info.append(f"🏋️ Current Weight: {prof.get('current_weight', 70.0)} kg")
+            profile_info.append(f"🎯 Target Weight: {prof.get('target_weight', 65.0)} kg")
+
+            # Add weight delta if available
+            if prof.get("weight_delta_text"):
+                profile_info.append(f"📊 Progress Goal: {prof['weight_delta_text']}")
+
+            # Add additional profile info
+            if prof.get("lifestyle"):
+                profile_info.append(f"🏃 Lifestyle: {prof['lifestyle']}")
+
+            if prof.get("target_calories"):
+                profile_info.append(f"🔥 Daily Calorie Target: {prof['target_calories']} kcal")
+
+            profile_display = "\n".join(profile_info)
+
+            # Use AI to generate a natural response asking for confirmation
+            try:
+                ai_response = AIConversationManager.generate_contextual_response(
+                    oai, OPENAI_MODEL, "PROFILE_CONFIRMATION",
+                    f"Show user profile and ask if they want workout based on this: {profile_display}",
+                    {"profile": prof}
+                )
+            except:
+                ai_response = "Would you like me to create a workout plan based on this profile, or would you like to modify anything first?"
+
+            # Set state to ask for template creation confirmation
+            await mem.set_pending(user_id, {
+                "state": "PROFILE_CONFIRMATION",
+                "profile": prof
+            })
+
+            message = f"Here's your current profile:\n\n{profile_display}\n\n{ai_response}"
+            print(f"🔍 DEBUG - Profile message being sent: {message}")
+
+            yield _evt({
+                "type": "workout_template",
+                "status": "profile_shown",
+                "message": message,
+                "profile_data": prof
+            })
+            yield "event: done\ndata: [DONE]\n\n"
+
+        return StreamingResponse(_fetch_and_show_profile(), media_type="text/event-stream",
+                            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+   # PROFILE_CONFIRMATION STATE - Handle user response to profile display
+   elif current_state == "PROFILE_CONFIRMATION":
+       # Simple rule-based detection for common responses
+       positive_words = ['yes', 'ok', 'okay', 'sure', 'profile', 'based', 'good', 'fine', 'create', 'go']
+       user_lower = user_input.lower()
+       is_positive = any(word in user_lower for word in positive_words)
+
+       if is_positive:
+           # User confirmed - proceed to ask for days
+           prof = pend.get("profile", {})
+           await mem.set_pending(user_id, {
+               "state": FlexibleConversationState.STATES["ASK_DAYS"],
+               "profile": prof
+           })
+
+           async def _proceed_to_days():
+               yield _evt({
+                   "type": "workout_template",
+                   "status": "ask_days",
+                   "message": "Great! How many days per week do you want to work out? (e.g., 3 days, 5 days, 6 days)"
+               })
+               yield "event: done\ndata: [DONE]\n\n"
+
+           return StreamingResponse(_proceed_to_days(), media_type="text/event-stream",
+                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+       else:
+           # Ask for clarification
+           async def _ask_clarification():
+               yield _evt({
+                   "type": "workout_template",
+                   "status": "ask_clarification",
+                   "message": "Would you like me to create a workout template based on your profile? Please let me know yes or no."
+               })
+               yield "event: done\ndata: [DONE]\n\n"
+
+           return StreamingResponse(_ask_clarification(), media_type="text/event-stream",
+                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+   # ASK_DAYS STATE - User provides number of days
+   elif current_state == FlexibleConversationState.STATES["ASK_DAYS"]:
+       # Simple rule-based days extraction
+       import re
+       days_match = re.search(r'\b(\d+)\s*(?:days?|workouts?)\b', user_input.lower())
+       if days_match:
+           days_count = int(days_match.group(1))
+       else:
+           # Try to find standalone numbers
+           number_match = re.search(r'\b([3-7])\b', user_input)
+           days_count = int(number_match.group(1)) if number_match else 5
        prof = pend.get("profile", {})
        prof["days_count"] = days_count
-      
+
+       # Move to ASK_NAMES state
        await mem.set_pending(user_id, {
            "state": FlexibleConversationState.STATES["ASK_NAMES"],
            "profile": prof
        })
-      
-       async def _ask_names():
+
+       
+
+       async def _process_days():
            yield _evt({
                "type": "workout_template",
                "status": "ask_names",
-               "message": f"🎯 Perfect - {days_count} workout days it is! 🎯\n\n" + SmartResponseGenerator.get_contextual_prompt("ASK_NAMES")
+               "message": f"Perfect! {days_count} workout days it is.\n\nDo you want to name your workout days? You can use day names (Monday, Tuesday...) or muscle groups (Push, Pull, Legs) or say 'default' to use standard names."
            })
            yield "event: done\ndata: [DONE]\n\n"
-          
-       return StreamingResponse(_ask_names(), media_type="text/event-stream",
+
+       return StreamingResponse(_process_days(), media_type="text/event-stream",
                               headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-  
-   # DRAFT_GENERATION STATE
-   elif next_state == FlexibleConversationState.STATES["DRAFT_GENERATION"]:
-    prof = pend.get("profile", {})
-    days_count = prof.get("days_count", 6)
-    template_names = UltraFlexibleParser.extract_template_names(user_input, days_count)
-    
-    # FIXED: Better muscle detection for single-word inputs
-    detected_muscle = None
-    user_input_clean = user_input.lower().strip()
-    
-    # Direct muscle mappings for common single-word requests
-    direct_muscle_map = {
-        'leg': 'legs',
-        'legs': 'legs', 
-        'chest': 'chest',
-        'back': 'back',
-        'arm': 'upper',
-        'arms': 'upper',
-        'shoulder': 'shoulders',
-        'shoulders': 'shoulders',
-        'core': 'core',
-        'abs': 'core',
-        'upper': 'upper',
-        'lower': 'legs'
-    }
-    
-    # Check if the entire input is just a muscle group
-    if user_input_clean in direct_muscle_map:
-        detected_muscle = direct_muscle_map[user_input_clean]
-        print(f"🎯 Direct muscle detection: '{user_input_clean}' -> {detected_muscle}")
-    
-    # If not direct match, check template names for muscle groups
-    if not detected_muscle:
-        muscle_keywords = {
-            'leg': 'legs', 'legs': 'legs', 
-            'chest': 'chest', 
-            'back': 'back',
-            'arm': 'upper', 'arms': 'upper',
-            'shoulder': 'shoulders', 'shoulders': 'shoulders',
-            'core': 'core', 'abs': 'core',
-            'upper': 'upper', 'lower': 'legs'
-        }
-        
-        for name in template_names:
-            name_lower = name.lower().strip()
-            if name_lower in muscle_keywords:
-                detected_muscle = muscle_keywords[name_lower]
-                print(f"🎯 Template name muscle detection: {name_lower} -> {detected_muscle}")
-                break
-    
-    if detected_muscle:
-        # FIXED: Use SmartWorkoutEditor directly for muscle-specific templates
-        prof["muscle_focus"] = detected_muscle
-        
-        # Use proper day names instead of just "monday"
-        if days_count <= 7:
-            day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-            prof['template_names'] = day_names[:days_count]
-        else:
-            prof['template_names'] = [f"Day {i+1}" for i in range(days_count)]
-        
-        prof['days_per_week'] = days_count
 
-        async def _generate_muscle_specific():
-            import asyncio
-            
-            try:
-                # CRITICAL FIX: Use SmartWorkoutEditor directly instead of LLM
-                muscle_distributions = {detected_muscle: days_count}
-                tpl, why = SmartWorkoutEditor.create_muscle_specific_template(
-                    prof['template_names'], 
-                    muscle_distributions, 
-                    db
-                )
-                
-                # Validate that we got appropriate exercises
-                if tpl and tpl.get('days'):
-                    first_day_key = list(tpl['days'].keys())[0]
-                    first_day = tpl['days'][first_day_key]
-                    exercises = first_day.get('exercises', [])
-                    
-                    if exercises:
-                        exercise_names = [ex.get('name', '').lower() for ex in exercises]
-                        print(f"✅ Generated {detected_muscle} exercises: {exercise_names}")
-                        
-                        # Validate muscle match
-                        validation = SmartWorkoutEditor.validate_exercise_match(detected_muscle, exercises)
-                        print(f"📊 Validation: {validation['message']}")
-                        
-                        if not validation['valid']:
-                            print(f"❌ Validation failed - regenerating with database approach")
-                            # Force regeneration with direct database query
-                            tpl, why = SmartWorkoutEditor.create_muscle_specific_template(
-                                ["monday"], 
-                                {detected_muscle: 1}, 
-                                db
-                            )
-                else:
-                    print(f"❌ No template generated, using fallback")
-                    tpl = {"name": f"{detected_muscle.title()} Workout", "goal": "muscle_gain", "days": {}, "notes": []}
-                    why = f"Could not generate {detected_muscle} workout"
-                
-                # Fix day keys to match expected format
-                if tpl and 'days' in tpl and prof.get('template_names'):
-                    new_days = {}
-                    template_names = prof['template_names']
-                    
-                    old_keys = list(tpl['days'].keys())
-                    for i, old_key in enumerate(old_keys):
-                        if i < len(template_names):
-                            # Use custom template name as day key
-                            new_key = template_names[i].lower().replace(' ', '_')
-                            new_days[new_key] = tpl['days'][old_key]
-                            # Update title to use custom name
-                            new_days[new_key]['title'] = f"{template_names[i]} — {detected_muscle.title()} Day"
-                        else:
-                            new_days[old_key] = tpl['days'][old_key]
-                    tpl['days'] = new_days
-                
-                md = render_markdown_from_template(tpl)
-                tpl_ids = build_id_only_structure(tpl)
-                
-                await mem.set_pending(user_id, {
-                    "state": FlexibleConversationState.STATES["EDIT_DECISION"],
-                    "profile": prof,
-                    "template": tpl
-                })
-                
-                yield _evt({
-                    "type": "workout_template",
-                    "status": "draft",
-                    "template_markdown": md,
-                    "template_json": tpl,
-                    "template_ids": tpl_ids,
-                    "message": _format_template_for_display(tpl), 
-                    "why": why or f"{days_count}-day {detected_muscle} focused template created!"
-                })
-                
-                yield _evt({
-                    "type": "workout_template",
-                    "status": "ask_edit_decision",
-                    "message": SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
-                })
-                
-            except Exception as e:
-                print(f"Muscle-specific generation error: {e}")
-                yield _evt({
-                    "type": "workout_template",
-                    "status": "error",
-                    "message": "Had trouble generating your leg workout. Want to try again with a different approach?"
-                })
-            
-            yield "event: done\ndata: [DONE]\n\n"
-        
-        return StreamingResponse(_generate_muscle_specific(), media_type="text/event-stream",
+   # ASK_NAMES & DRAFT_GENERATION STATE - Combined for immediate execution
+   elif current_state == FlexibleConversationState.STATES["ASK_NAMES"] or current_state == FlexibleConversationState.STATES["DRAFT_GENERATION"] or next_state == "DRAFT_GENERATION":
+       print(f"🎯 ENTERING TEMPLATE GENERATION!")
+       prof = pend.get("profile", {})
+
+       # If coming from ASK_NAMES, process the names first
+       if current_state == FlexibleConversationState.STATES["ASK_NAMES"]:
+           days_count = prof.get("days_count", 5)
+
+           # Extract names from user input or use defaults
+           if "default" in user_input.lower():
+               day_names = [f"Day {i+1}" for i in range(days_count)]
+           else:
+               # Try to extract names from user input
+               extracted_names = ai_analysis.get("day_names", [])
+               if extracted_names and len(extracted_names) >= days_count:
+                   day_names = extracted_names[:days_count]
+               else:
+                   # Use standard day names
+                   standard_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+                   day_names = standard_days[:days_count]
+
+           prof["template_names"] = day_names
+           prof["template_count"] = len(day_names)
+
+       async def _generate_template():
+           try:
+               print("🔍 DEBUG - Starting template generation")
+
+               # Send generating status
+               yield _evt({
+                   "type": "workout_template",
+                   "status": "generating",
+                   "message": "Creating your personalized workout template..."
+               })
+
+               # Ensure profile has required fields
+               if "template_names" not in prof:
+                   prof["template_names"] = [f"Day {i+1}" for i in range(prof.get("days_count", 5))]
+               if "template_count" not in prof:
+                   prof["template_count"] = len(prof["template_names"])
+
+               print(f"🔍 DEBUG - Profile ready: {prof.get('template_names', [])}")
+
+               # Generate template
+               print("🔍 DEBUG - Calling template generation")
+               try:
+                   tpl, why = llm_generate_template_from_profile(oai, OPENAI_MODEL, prof, db)
+                   print(f"🔍 DEBUG - Template generated: {type(tpl)}")
+               except Exception as gen_error:
+                   print(f"🚨 Generation failed: {gen_error}")
+                   # Create fallback template
+                   template_names = prof.get("template_names", ["Day 1"])
+                   tpl = {
+                       "name": f"Fallback Workout ({len(template_names)} days)",
+                       "goal": "muscle_gain",
+                       "days": {},
+                       "notes": []
+                   }
+                   for name in template_names:
+                       day_key = name.lower()
+                       tpl["days"][day_key] = {
+                           "title": name.title(),
+                           "muscle_groups": ["full body"],
+                           "exercises": [
+                               {"name": "Push-ups", "sets": 3, "reps": 10},
+                               {"name": "Squats", "sets": 3, "reps": 12},
+                               {"name": "Plank", "sets": 3, "reps": "30 seconds"}
+                           ]
+                       }
+
+               # Process template for display
+               print("🔍 DEBUG - Processing template for display")
+               tpl = _ensure_unique_exercise_ids(tpl)
+               md = render_markdown_from_template(tpl)
+               tpl_ids = build_id_only_structure(tpl)
+
+               # Update state
+               await mem.set_pending(user_id, {
+                   "state": FlexibleConversationState.STATES["EDIT_DECISION"],
+                   "profile": prof,
+                   "template": tpl
+               })
+
+               # Return success response with template in message field for frontend display
+               yield _evt({
+                   "type": "workout_template",
+                   "status": "draft",
+                   "template_markdown": md,
+                   "template_json": tpl,
+                   "template_ids": tpl_ids,
+                   "why": "Generated based on your profile",
+                   "message": f"Here's your personalized workout template:\n\n{md}"
+               })
+
+               # Add the follow-up question like the working version
+               yield _evt({
+                   "type": "workout_template",
+                   "status": "ask_edit_q",
+                   "ask": "How does this look? Say 'save it' if you're happy, or tell me what you'd like to change!"
+               })
+
+           except Exception as e:
+               print(f"❌ Template generation error: {e}")
+               import traceback
+               traceback.print_exc()
+
+               # Send error response
+               yield _evt({
+                   "type": "workout_template",
+                   "status": "error",
+                   "message": "I had trouble generating your workout template. This might be due to a temporary issue. Would you like to try again?"
+               })
+
+           yield "event: done\ndata: [DONE]\n\n"
+
+       return StreamingResponse(_generate_template(), media_type="text/event-stream",
                                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-    else:
-        # Continue with normal template generation for non-muscle-specific requests
-        prof["template_names"] = template_names
-        prof["days_per_week"] = days_count
 
-  
+   # EDIT_DECISION STATE - User decides to edit or save template
+   elif current_state == FlexibleConversationState.STATES["EDIT_DECISION"]:
+       prof = pend.get("profile", {})
+       tpl = pend.get("template", {})
+
+       # Check if user wants to save
+       save_commands = ['save', 'save it', 'store', 'store it', 'keep', 'keep it', 'perfect', 'looks good', 'good to go',
+                       'finalize', 'finalize it', 'done', 'ready', 'confirm', 'approved', 'accept', 'yes save',
+                       'save template', 'save plan', 'save workout', 'this is good', 'looks great', 'all set']
+       if any(cmd in user_input.lower() for cmd in save_commands):
+           # User wants to save - move to CONFIRM_SAVE
+           await mem.set_pending(user_id, {
+               "state": FlexibleConversationState.STATES["CONFIRM_SAVE"],
+               "profile": prof,
+               "template": tpl
+           })
+
+           async def _confirm_save():
+               yield _evt({
+                   "type": "workout_template",
+                   "status": "confirm_save",
+                   "message": "Perfect! Are you sure you want to save this workout template?"
+               })
+               yield "event: done\ndata: [DONE]\n\n"
+
+           return StreamingResponse(_confirm_save(), media_type="text/event-stream",
+                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+       else:
+           # Check if user input contains clear edit instructions
+           clear_edit_patterns = [
+               # Day name changes
+               'change', 'rename', 'call it', 'make it', 'name it',
+               # Exercise modifications
+               'add', 'remove', 'replace', 'substitute', 'swap', 'include', 'delete',
+               # Adjustments
+               'increase', 'decrease', 'more', 'less', 'easier', 'harder',
+               # Specific instructions
+               'from', 'to', 'instead of', 'with', 'for'
+           ]
+
+           user_lower = user_input.lower()
+           has_clear_instruction = any(pattern in user_lower for pattern in clear_edit_patterns)
+
+           # Also check for specific structures like "X to Y" or "change X"
+           has_specific_structure = (
+               ' to ' in user_lower or
+               ' from ' in user_lower or
+               'change ' in user_lower or
+               'rename ' in user_lower or
+               'add ' in user_lower or
+               'remove ' in user_lower
+           )
+
+           if has_clear_instruction or has_specific_structure:
+               # User gave clear instructions - apply edit directly without asking
+               print(f"🎯 Clear edit instruction detected: {user_input}")
+
+               async def _apply_direct_edit():
+                   try:
+                       # Apply the edit using the same logic as APPLY_EDIT state
+                       from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_llm_helper import enhanced_edit_template
+
+                       new_tpl, summary = enhanced_edit_template(oai, OPENAI_MODEL, tpl, user_input, prof, db)
+
+                       # Ensure unique exercise IDs before rendering
+                       new_tpl = _ensure_unique_exercise_ids(new_tpl)
+                       md = render_markdown_from_template(new_tpl)
+                       tpl_ids = build_id_only_structure(new_tpl)
+
+                       await mem.set_pending(user_id, {
+                           "state": FlexibleConversationState.STATES["EDIT_DECISION"],
+                           "profile": prof,
+                           "template": new_tpl
+                       })
+
+                       yield _evt({
+                           "type": "workout_template",
+                           "status": "draft",
+                           "template_markdown": md,
+                           "template_json": new_tpl,
+                           "template_ids": tpl_ids,
+                           "message": f"Great! I've made that change:\n\n{md}",
+                           "why": summary or "Applied your requested change"
+                       })
+
+                       yield _evt({
+                           "type": "workout_template",
+                           "status": "ask_edit_q",
+                           "ask": "How does this look now? Say 'save it' if you're happy, or tell me what else you'd like to change!"
+                       })
+
+                   except Exception as e:
+                       print(f"Direct edit error: {e}")
+                       yield _evt({
+                           "type": "workout_template",
+                           "status": "error",
+                           "message": "I had trouble making that change. Could you try describing it differently?"
+                       })
+
+                   yield "event: done\ndata: [DONE]\n\n"
+
+               return StreamingResponse(_apply_direct_edit(), media_type="text/event-stream",
+                                      headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+           else:
+               # User input is unclear - ask for clarification
+               await mem.set_pending(user_id, {
+                   "state": FlexibleConversationState.STATES["APPLY_EDIT"],
+                   "profile": prof,
+                   "template": tpl
+               })
+
+               async def _ask_for_edits():
+                   yield _evt({
+                       "type": "workout_template",
+                       "status": "ask_for_edits",
+                       "message": "What would you like to change? You can say things like:\n• 'Change day name from Monday to Push Day'\n• 'Add more chest exercises'\n• 'Remove squats and add lunges'\n• 'Make it easier'"
+                   })
+                   yield "event: done\ndata: [DONE]\n\n"
+
+               return StreamingResponse(_ask_for_edits(), media_type="text/event-stream",
+                                      headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
    # APPLY_EDIT STATE
-   elif next_state == FlexibleConversationState.STATES["APPLY_EDIT"]:
+   elif current_state == FlexibleConversationState.STATES["APPLY_EDIT"]:
     prof = pend.get("profile", {})
     tpl = pend.get("template")
 
@@ -1294,264 +1653,54 @@ async def ultra_flexible_workout_stream(
 
     async def _apply_edit():
         try:
-            # Check for bulk operations - using imported function
-            bulk_info = extract_bulk_operation_info(user_input)  # Use imported function
-            
-            
-            # Call enhanced edit function (rest remains the same)
+            # Validate exercises using AI before editing
+            exercise_validation = AIConversationManager.validate_and_map_exercises(oai, OPENAI_MODEL, user_input, db)
+
+            # Call enhanced edit function with validated exercises
             new_tpl, summary = enhanced_edit_template(oai, OPENAI_MODEL, tpl, user_input, prof, db)
-            
-            # Rest of the validation and response logic remains the same...
+
+            # Ensure unique exercise IDs before rendering
+            new_tpl = _ensure_unique_exercise_ids(new_tpl)
             md = render_markdown_from_template(new_tpl)
             tpl_ids = build_id_only_structure(new_tpl)
-            
+
             await mem.set_pending(user_id, {
                 "state": FlexibleConversationState.STATES["EDIT_DECISION"],
                 "profile": prof,
                 "template": new_tpl
             })
-            
+
             yield _evt({
                 "type": "workout_template",
-                "status": "edit_applied",
+                "status": "edited",
                 "template_markdown": md,
                 "template_json": new_tpl,
                 "template_ids": tpl_ids,
-                "message": _format_template_for_display(new_tpl),  
-                "summary": summary or "Made those changes for you!"
-            })
-            
-            yield _evt({
-                "type": "workout_template",
-                "status": "ask_edit_decision",
                 "message": SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
             })
-            
+
         except Exception as e:
             print(f"Enhanced edit error: {e}")
             yield _evt({
                 "type": "workout_template",
                 "status": "error",
-                "message": "🤔 Had trouble applying that change.\n\n💡 Can you try describing it differently?\n✨ I'm here to help make it perfect!"
+                "message": "I had trouble making that change. Could you try describing it differently?"
             })
-        
-        yield "event: done\ndata: [DONE]\n\n"
-    
-    return StreamingResponse(_apply_edit(), media_type="text/event-stream",
-                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-  
+        yield "event: done\ndata: [DONE]\n\n"
+
+    return StreamingResponse(_apply_edit(), media_type="text/event-stream",
+                           headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
    # CONFIRM_SAVE STATE
-   elif next_state == FlexibleConversationState.STATES["CONFIRM_SAVE"]:
-       prof = pend.get("profile", {})
-       tpl = pend.get("template", {})
-      
-       await mem.set_pending(user_id, {
-           "state": FlexibleConversationState.STATES["CONFIRM_SAVE"],
-           "profile": prof,
-           "template": tpl
-       })
-      
-       async def _confirm_save():
-           yield _evt({
-               "type": "workout_template",
-               "status": "confirm_save",
-               "message": SmartResponseGenerator.get_contextual_prompt("CONFIRM_SAVE")
-           })
-           yield "event: done\ndata: [DONE]\n\n"
-          
-       return StreamingResponse(_confirm_save(), media_type="text/event-stream",
-                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-  
-   # DONE STATE (Save template)
-   elif next_state == FlexibleConversationState.STATES["DONE"]:
-       prof = pend.get("profile", {})
-       tpl = pend.get("template", {})
-       template_name = tpl.get("name") or f"Custom Workout ({', '.join(prof.get('template_names', ['Multi-Day']))})"
-      
-       async def _save_and_complete():
-          
-           success = await _store_template(mem, db, user_id, tpl, template_name)
-          
-           if success:
-               # Call structurize function directly
-               try:
-                   request_data = StructurizeAndSaveRequest(client_id=user_id, template=tpl)
-                   await structurize_and_save(request_data, db)
-               except Exception as e:
-                   print("structurize_and_save failed:", e)
-              
-               await mem.set_pending(user_id, None)  # Clear state
-              
-               yield _evt({
-                   "type": "workout_template",
-                   "status": "stored",
-                   "template_name": template_name,
-                   "info": "🎉 Your workout template has been saved successfully! 🎉"
-               })
-              
-               yield _evt({
-                   "type": "workout_template",
-                   "status": "done",
-                   "message": "🏆 Perfect! Your personalized workout is ready now! 🏆\n\n💪 Time to crush those fitness goals!\n🎯 Your template is saved and ready to use anytime!"
-               })
-           else:
-               yield _evt({
-                   "type": "workout_template",
-                   "status": "error",
-                   "message": "⚠️ Oops! Couldn't save the template right now.\n\n🔄 Want to try again? Just say 'save it' once more!\n💬 I'm here to help you get this sorted!"
-               })
-          
-           yield "event: done\ndata: [DONE]\n\n"
-          
-       return StreamingResponse(_save_and_complete(), media_type="text/event-stream",
-                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-  
-   # ═══════════════════════════════════════════════════════════════
-   # CONTEXT-AWARE STATE HANDLING - ULTRA FLEXIBLE RESPONSES
-   # ═══════════════════════════════════════════════════════════════
-  
-   # Handle EDIT_DECISION state responses
-   if current_state == FlexibleConversationState.STATES["EDIT_DECISION"]:
+   elif current_state == FlexibleConversationState.STATES["CONFIRM_SAVE"]:
     prof = pend.get("profile", {})
     tpl = pend.get("template", {})
-    
-    # Check for explicit save commands
-    save_commands = ['save', 'save it', 'store', 'store it', 'keep', 'keep it', 'perfect', 'looks good', 'good to go']
-    if any(cmd in user_input.lower() for cmd in save_commands):
-        # User wants to save, go to confirm save
-        await mem.set_pending(user_id, {
-            "state": FlexibleConversationState.STATES["CONFIRM_SAVE"],
-            "profile": prof,
-            "template": tpl
-        })
-        
-        async def _go_to_save():
-            yield _evt({
-                "type": "workout_template",
-                "status": "confirm_save",
-                "message": SmartResponseGenerator.get_contextual_prompt("CONFIRM_SAVE")
-            })
-            yield "event: done\ndata: [DONE]\n\n"
-            
-        return StreamingResponse(_go_to_save(), media_type="text/event-stream",
-                               headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-    
-    elif UltraFlexibleParser.is_negative_response(user_input) and 'change' not in user_input.lower() and 'edit' not in user_input.lower():
-        # User is satisfied, go to confirm save
-        await mem.set_pending(user_id, {
-            "state": FlexibleConversationState.STATES["CONFIRM_SAVE"],
-            "profile": prof,
-            "template": tpl
-        })
-        
-        async def _go_to_save():
-            yield _evt({
-                "type": "workout_template",
-                "status": "confirm_save",
-                "message": SmartResponseGenerator.get_contextual_prompt("CONFIRM_SAVE")
-            })
-            yield "event: done\ndata: [DONE]\n\n"
-            
-        return StreamingResponse(_go_to_save(), media_type="text/event-stream",
-                               headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-    
-    else:
-        # User gave specific edit instructions directly - PRESERVE TEMPLATE
-        async def _direct_edit():
-            try:
-                # CRITICAL: Ensure template is preserved
-                current_template = tpl.copy() if tpl else {}
-                
-                if not current_template or not current_template.get('days'):
-                    yield _evt({
-                        "type": "workout_template",
-                        "status": "error",
-                        "message": "I seem to have lost your template. Let me recreate it for you. Could you say 'create new template' to start fresh?"
-                    })
-                    return
-                
-                # Analyze the edit request intelligently
-                analysis = SmartWorkoutEditor.analyze_edit_request(user_input, current_template)
-                
-                # Check if request is feasible
-                if analysis['target_day']:
-                    day_exercises = current_template.get('days', {}).get(analysis['target_day'], {}).get('exercises', [])
-                    limits = SmartWorkoutEditor.check_exercise_limits(day_exercises, analysis['target_muscle'])
-                    
-                    # Handle overloaded day
-                    if limits['is_overloaded'] and analysis['should_add']:
-                        yield _evt({
-                            "type": "workout_template",
-                            "status": "constraint_message",
-                            "message": f"{analysis['target_day'].title()} already has {limits['total_count']} exercises, which is quite comprehensive! Would you like me to replace an existing exercise instead?"
-                        })
-                        yield _evt({
-                            "type": "workout_template",
-                            "status": "ask_edit_decision",
-                            "message": SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
-                        })
-                        return
-                
-                
-                # Generate enhanced prompt for LLM
-                smart_prompt = SmartWorkoutEditor.generate_smart_edit_prompt(user_input, analysis, current_template)
-                
-                new_tpl, summary = enhanced_edit_template(oai, OPENAI_MODEL, current_template, smart_prompt, prof, db)
-                
-                # CRITICAL: Validate that template wasn't corrupted
-                if not new_tpl or not new_tpl.get('days') or all(not day.get('exercises') for day in new_tpl.get('days', {}).values()):
-                    # LLM corrupted the template, keep original
-                    new_tpl = current_template
-                    summary = "I had trouble making that change while preserving your workout structure. The template has been kept as-is. Could you try rephrasing your request?"
-                
-                md = render_markdown_from_template(new_tpl)
-                tpl_ids = build_id_only_structure(new_tpl)
-               
-                await mem.set_pending(user_id, {
-                    "state": FlexibleConversationState.STATES["EDIT_DECISION"],
-                    "profile": prof,
-                    "template": new_tpl
-                })
-               
-                yield _evt({
-                    "type": "workout_template",
-                    "status": "edit_applied",
-                    "template_markdown": md,
-                    "template_json": new_tpl,
-                    "template_ids": tpl_ids,
-                    "message": _format_template_for_display(new_tpl),
-                    "summary": summary or "Updated as requested!"
-                })
-               
-                yield _evt({
-                    "type": "workout_template",
-                    "status": "ask_edit_decision",
-                    "message": SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
-                })
-               
-            except Exception as e:
-                print(f"Direct edit error: {e}")
-                yield _evt({
-                    "type": "workout_template",
-                    "status": "error",
-                    "message": "Had trouble with that change. Can you try rephrasing what you'd like me to modify?"
-                })
-           
-            yield "event: done\ndata: [DONE]\n\n"
-           
-        return StreamingResponse(_direct_edit(), media_type="text/event-stream",
-                               headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-  
-   # Handle CONFIRM_SAVE state responses 
-   if current_state == FlexibleConversationState.STATES["CONFIRM_SAVE"]:
-    prof = pend.get("profile", {})
-    tpl = pend.get("template", {})
-    
-    if UltraFlexibleParser.is_positive_response(user_input) or user_input.lower().strip() in ['save', 'yes', 'confirm']:
+
+    if ai_analysis.get("positive_sentiment") or user_intent in ["save", "yes"] or user_input.lower().strip() in ['save', 'yes', 'confirm']:
         # Save the template
         template_name = tpl.get("name") or f"Custom Workout ({', '.join(prof.get('template_names', ['Multi-Day']))})"
-        
+
         async def _final_save():
             # Validate template before saving
             if not _validate_template_integrity(tpl):
@@ -1562,51 +1711,91 @@ async def ultra_flexible_workout_stream(
                 })
                 yield "event: done\ndata: [DONE]\n\n"
                 return
-            
-            
+
             success = await _store_template(mem, db, user_id, tpl, template_name)
-            
+
             if success:
+                # Save structured template using workout_structured functions
                 try:
-                    request_data = StructurizeAndSaveRequest(client_id=user_id, template=tpl)
-                    await structurize_and_save(request_data, db)
+                    # Ensure template has exercise IDs before saving
+                    tpl_with_ids = await _ensure_template_has_ids(tpl, db)
+                    if not tpl_with_ids:
+                        yield _evt({
+                            "type": "workout_template",
+                            "status": "error",
+                            "message": "❌ Unable to assign exercise IDs to template. Please try creating the template again."
+                        })
+                        yield "event: done\ndata: [DONE]\n\n"
+                        return
+
+                    # 1) Collect ids by day and fetch all rows in one shot
+                    per_day_ids = _gather_ids(tpl_with_ids)
+                    all_ids = [eid for ids in per_day_ids.values() for eid in ids]
+                    id_map = _fetch_qr_rows(db, all_ids)
+
+                    # 2) Build payload per day and upsert
+                    results = []
+                    for day in per_day_ids.keys():
+                        day_ids = per_day_ids.get(day, [])
+                        if not day_ids:
+                            continue
+
+                        payload = _build_day_payload(day_ids, id_map)
+
+                        # Validate payload is not empty
+                        if not payload or len(payload) == 0:
+                            continue
+
+                        results.append(_persist_payload(db, user_id, day, payload))
+
+                    # 3) Commit the changes
+                    if results:
+                        db.commit()
+                        print(f"✅ Successfully saved structured template for client {user_id} with {len(results)} days")
+
+                        # Clear pending state after successful save
+                        await mem.clear_pending(user_id)
+
+                        yield _evt({
+                            "type": "workout_template",
+                            "status": "saved",
+                            "message": f"🎉 Successfully saved your '{template_name}' workout template!\n\n✅ Your personalized plan is ready to use anytime.\n🚀 Ready to start your fitness journey!"
+                        })
+                    else:
+                        db.rollback()
+                        yield _evt({
+                            "type": "workout_template",
+                            "status": "error",
+                            "message": "❌ Unable to save template - no valid exercise data found. This might be due to missing exercise IDs or database connectivity issues. The template was saved in memory but not in the structured database."
+                        })
                 except Exception as e:
-                    print("structurize_and_save failed:", e)
-                
-                await mem.set_pending(user_id, None)
-                
-                yield _evt({
-                    "type": "workout_template",
-                    "status": "stored",
-                    "template_name": template_name,
-                    "info": "🎉 Awesome! Your workout template is now saved and ready to use! 🎉"
-                })
-                
-                yield _evt({
-                    "type": "workout_template",
-                    "status": "done",
-                    "message": "🎯 All set! Your workout is ready to rock! 🎯\n\n📋 Say 'show my template' to view it anytime\n✏️ Say 'edit template' to create variations\n💬 What else can I help you with?"
-                })
+                    db.rollback()
+                    print(f"🚨 Failed to save structured template: {e}")
+                    yield _evt({
+                        "type": "workout_template",
+                        "status": "error",
+                        "message": "Sorry, there was an issue saving your template to the database. The template was saved in chat memory, but the structured version failed. Please try again!"
+                    })
             else:
                 yield _evt({
                     "type": "workout_template",
                     "status": "error",
-                    "message": "Couldn't save right now - want to try again? Just say 'save' or let me know!"
+                    "message": "Sorry, there was an issue saving your template. Please try again!"
                 })
-            
+
             yield "event: done\ndata: [DONE]\n\n"
-            
+
         return StreamingResponse(_final_save(), media_type="text/event-stream",
                                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-    
-    elif UltraFlexibleParser.is_negative_response(user_input):
+
+    elif ai_analysis.get("negative_sentiment") or user_intent == "no":
         # Go back to editing
         await mem.set_pending(user_id, {
             "state": FlexibleConversationState.STATES["EDIT_DECISION"],
             "profile": prof,
             "template": tpl
         })
-        
+
         async def _back_to_edit():
             yield _evt({
                 "type": "workout_template",
@@ -1614,397 +1803,59 @@ async def ultra_flexible_workout_stream(
                 "message": "No problem! " + SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
             })
             yield "event: done\ndata: [DONE]\n\n"
-            
+
         return StreamingResponse(_back_to_edit(), media_type="text/event-stream",
                                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-    
-    else:
-        # Treat as edit instruction - but preserve template
-        async def _edit_from_save():
-            try:
-                current_template = tpl.copy() if tpl else {}
-                
-                if not _validate_template_integrity(current_template):
-                    yield _evt({
-                        "type": "workout_template",
-                        "status": "error",
-                        "message": "The template seems corrupted. Let me help create a new one. Say 'create template' to start over."
-                    })
-                    yield "event: done\ndata: [DONE]\n\n"
-                    return
-                
-                # Rest of edit logic...
-                analysis = SmartWorkoutEditor.analyze_edit_request(user_input, current_template)
-                
-                
-                smart_prompt = SmartWorkoutEditor.generate_smart_edit_prompt(user_input, analysis, current_template)
-               
-                new_tpl, summary = enhanced_edit_template(oai, OPENAI_MODEL, current_template, smart_prompt, prof, db)
-                
-                # Validate result
-                if not _validate_template_integrity(new_tpl):
-                    new_tpl = current_template
-                    summary = "Had trouble making that change while preserving your workout. Template kept as-is."
-                
-                md = render_markdown_from_template(new_tpl)
-                tpl_ids = build_id_only_structure(new_tpl)
-               
-                await mem.set_pending(user_id, {
-                    "state": FlexibleConversationState.STATES["EDIT_DECISION"],
-                    "profile": prof,
-                    "template": new_tpl
-                })
-               
-                yield _evt({
-                    "type": "workout_template",
-                    "status": "edit_applied",
-                    "template_markdown": md,
-                    "template_json": new_tpl,
-                    "template_ids": tpl_ids,
-                    "message": _format_template_for_display(new_tpl),
-                    "summary": summary or "Made that change!"
-                })
-               
-                yield _evt({
-                    "type": "workout_template",
-                    "status": "ask_edit_decision",
-                    "message": SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
-                })
-               
-            except Exception as e:
-                print(f"Edit from save error: {e}")
-                yield _evt({
-                    "type": "workout_template",
-                    "status": "confirm_save",
-                    "message": "Didn't catch that change. " + SmartResponseGenerator.get_contextual_prompt("CONFIRM_SAVE")
-                })
-           
-            yield "event: done\ndata: [DONE]\n\n"
-           
-        return StreamingResponse(_edit_from_save(), media_type="text/event-stream",
-                               headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-  
-   # ═══════════════════════════════════════════════════════════════
-   # ULTRA-FLEXIBLE INPUT HANDLING FOR SPECIFIC STATES
-   # ═══════════════════════════════════════════════════════════════
-  
-  
-   # Handle ASK_NAMES state when user provides names
-   if current_state == FlexibleConversationState.STATES["ASK_NAMES"]:
-       prof = pend.get("profile", {})
-       days_count = prof.get("days_count", 6)
-       template_names = UltraFlexibleParser.extract_template_names(user_input, days_count)
-    
-       prof["template_names"] = template_names
-       prof["days_per_week"] = days_count
-    
-       async def _got_names():
-           import asyncio
-           names_str = ", ".join(template_names)
-        
-           try:
-               tpl, why = llm_generate_template_from_profile(oai, OPENAI_MODEL, prof, db)
 
-                # FIXED: Use custom day names instead of overwriting with standard names
-               if tpl and 'days' in tpl and template_names:
-                    new_days = {}
-                    old_keys = list(tpl['days'].keys())
-
-                    for i, template_name in enumerate(template_names):
-                        if i < len(old_keys):
-                            old_key = old_keys[i]
-                            # Use the custom name as the day key (lowercase)
-                            new_key = template_name.lower().replace(' ', '_')
-                            new_days[new_key] = tpl['days'][old_key].copy()
-
-                            # CRITICAL FIX: Update the title to show custom day name
-                            original_title = new_days[new_key].get('title', '')
-                            if original_title and original_title.lower() != template_name.lower():
-                                # Combine custom name with muscle focus if available
-                                new_days[new_key]['title'] = f"{template_name} — {original_title}"
-                            else:
-                                # Just use the custom name
-                                new_days[new_key]['title'] = template_name
-
-                    tpl['days'] = new_days
-               md = render_markdown_from_template(tpl)
-               tpl_ids = build_id_only_structure(tpl)
-              
-               await mem.set_pending(user_id, {
-                   "state": FlexibleConversationState.STATES["EDIT_DECISION"],
-                   "profile": prof,
-                   "template": tpl
-               })
-              
-               yield _evt({
-                    "type": "workout_template",
-                    "status": "draft",
-                    "template_markdown": md,
-                    "template_json": tpl,
-                    "template_ids": tpl_ids,
-                    "message": _format_template_for_display(tpl), 
-                    "why": why or "Tailored specifically for your fitness journey!"
-                })
-              
-               yield _evt({
-                   "type": "workout_template",
-                   "status": "ask_edit_decision",
-                   "message": SmartResponseGenerator.get_contextual_prompt("EDIT_DECISION")
-               })
-              
-           except Exception as e:
-               print(f"Names generation error: {e}")
-               yield _evt({
-                   "type": "workout_template",
-                   "status": "error",
-                   "message": "Had trouble creating your template. Want to try different names or start over? I'm flexible!"
-               })
-          
-           yield "event: done\ndata: [DONE]\n\n"
-          
-       return StreamingResponse(_got_names(), media_type="text/event-stream",
-                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-  
-   # ═══════════════════════════════════════════════════════════════
-   # ULTIMATE FALLBACK - CONTEXT-AWARE SMART RESPONSES
-   # ═══════════════════════════════════════════════════════════════
-  
+   # ULTIMATE FALLBACK - AI-powered context-aware responses
    async def _ultra_smart_fallback():
-       # Ultra-context-aware fallback responses
-       if not pend:
-           # No context - offer main options with personality
+       # AI-powered context-aware fallback responses
+       try:
+           ai_response = AIConversationManager.generate_contextual_response(
+               oai, OPENAI_MODEL, current_state, user_input, pend
+           )
            yield _evt({
                "type": "workout_template",
                "status": "hint",
-               "message": "I'm your workout template assistant! I can help you create personalized plans, show existing templates, or make edits. Just tell me what you need - like 'make me a workout', 'show my plan', or 'change my routine'. What sounds good?"
+               "message": ai_response
            })
-      
-       elif current_state == FlexibleConversationState.STATES["START"]:
-           # Just starting - be encouraging
+       except Exception as e:
+           print(f"AI response generation failed: {e}")
+           # Fallback to simple response
+           if not pend:
+               message = "I'm your workout template assistant! I can help you create personalized plans, show existing templates, or make edits. Just tell me what you need - like 'make me a workout', 'show my plan', or 'change my routine'. What sounds good?"
+           elif current_state == FlexibleConversationState.STATES["START"]:
+               # Show profile immediately in START state
+               prof = _fetch_profile(db, user_id)
+               print(f"🔍 DEBUG - Fetched profile in START fallback for client {user_id}: {prof}")
+
+               profile_info = []
+               profile_info.append(f"💪 Goal: {prof.get('client_goal', 'muscle gain')}")
+               profile_info.append(f"📈 Experience: {prof.get('experience', 'beginner')}")
+               profile_info.append(f"🏋️ Current Weight: {prof.get('current_weight', 70.0)} kg")
+               profile_info.append(f"🎯 Target Weight: {prof.get('target_weight', 65.0)} kg")
+
+               if prof.get("weight_delta_text"):
+                   profile_info.append(f"📊 Progress Goal: {prof['weight_delta_text']}")
+               if prof.get("lifestyle"):
+                   profile_info.append(f"🏃 Lifestyle: {prof['lifestyle']}")
+               if prof.get("target_calories"):
+                   profile_info.append(f"🔥 Daily Calorie Target: {prof['target_calories']} kcal")
+
+               profile_display = "\n".join(profile_info)
+               message = f"Hi! I'm your workout template assistant. Here's your current profile:\n\n{profile_display}\n\nWould you like me to create a workout plan based on this profile, or do you have any specific preferences?"
+
+               print(f"🔍 DEBUG - START fallback message: {message}")
+           else:
+               message = "I didn't quite catch that, but I'm here to help! You can describe what you want naturally - like 'yes', 'no', 'change this exercise', 'make it harder', or tell me exactly what you're thinking. What would you like to do?"
+
            yield _evt({
                "type": "workout_template",
                "status": "hint",
-               "message": "Let's create something amazing! Tell me you want a workout plan and I'll build one just for you. You can say anything like 'create workout', 'make me a routine', or 'I need a plan' - I understand natural language!"
+               "message": message
            })
-          
-          
-          
-       else:
-           # Generic but helpful
-           yield _evt({
-               "type": "workout_template",
-               "status": "hint",
-               "message": "I didn't quite catch that, but I'm here to help! You can describe what you want naturally - like 'yes', 'no', 'change this exercise', 'make it harder', or tell me exactly what you're thinking. What would you like to do?"
-           })
-      
+
        yield "event: done\ndata: [DONE]\n\n"
-  
+
    return StreamingResponse(_ultra_smart_fallback(), media_type="text/event-stream",
                           headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-# ═══════════════════════════════════════════════════════════════
-# ADDITIONAL ENHANCED HELPER ENDPOINTS
-# ═══════════════════════════════════════════════════════════════
-@router.post("/reset_conversation")
-async def reset_conversation(user_id: int, mem = Depends(get_mem)):
-   """Reset conversation state for user"""
-   await mem.set_pending(user_id, None)
-   return {
-       "status": "reset",
-       "message": "Conversation state cleared - ready for a fresh start!",
-       "user_id": user_id
-   }
-@router.get("/conversation_status")
-async def get_conversation_status(user_id: int, mem = Depends(get_mem)):
-   """Get detailed conversation state"""
-   pend = await mem.get_pending(user_id)
-   profile = pend.get("profile", {}) if pend else {}
-  
-   return {
-       "user_id": user_id,
-       "current_state": pend.get("state") if pend else "none",
-       "has_profile": bool(pend.get("profile")) if pend else False,
-       "has_template": bool(pend.get("template")) if pend else False,
-       "profile_details": {
-           "days_count": profile.get("days_count"),
-           "template_names": profile.get("template_names"),
-           "client_goal": profile.get("client_goal"),
-           "experience": profile.get("experience")
-       } if profile else None,
-       "can_transition_to": "any_state",
-       "flexibility_level": "ultra_high"
-   }
-@router.get("/debug_intent")
-async def debug_intent_parsing(text: str):
-   """Debug endpoint to test intent parsing"""
-   user_intent, confidence = UltraFlexibleParser.extract_intent(text)
-   days_count = UltraFlexibleParser.extract_days_count(text)
-   template_names = UltraFlexibleParser.extract_template_names(text, days_count)
-   is_positive = UltraFlexibleParser.is_positive_response(text)
-   is_negative = UltraFlexibleParser.is_negative_response(text)
-  
-   return {
-       "input": text,
-       "parsing_results": {
-           "intent": user_intent,
-           "confidence": confidence,
-           "days_count": days_count,
-           "template_names": template_names,
-           "is_positive": is_positive,
-           "is_negative": is_negative
-       },
-       "flexibility_features": [
-           "typo_tolerance",
-           "natural_language_processing",
-           "context_awareness",
-           "fuzzy_matching",
-           "multi_pattern_detection"
-       ]
-   }
-# ═══════════════════════════════════════════════════════════════
-# ENHANCED ERROR HANDLING AND RECOVERY
-# ═══════════════════════════════════════════════════════════════
-@router.post("/recover_conversation")
-async def recover_conversation(
-   user_id: int,
-   recovery_data: Dict[str, Any],
-   mem = Depends(get_mem)
-):
-   """Recover conversation from a specific state with data"""
-   try:
-       await mem.set_pending(user_id, recovery_data)
-       return {
-           "status": "recovered",
-           "message": "Conversation state has been restored",
-           "recovered_state": recovery_data.get("state"),
-           "user_id": user_id
-       }
-   except Exception as e:
-       return {
-           "status": "error",
-           "message": f"Failed to recover conversation: {str(e)}",
-           "user_id": user_id
-       }
-@router.get("/health_check")
-async def health_check():
-   """Health check endpoint for the ultra-flexible workout chatbot"""
-   return {
-       "status": "healthy",
-       "service": "ultra_flexible_workout_chatbot",
-       "features": {
-           "ultra_flexible_parsing": True,
-           "typo_tolerance": True,
-           "natural_language_understanding": True,
-           "context_aware_transitions": True,
-           "free_form_conversation": True,
-           "multi_state_jumping": True
-       },
-       "supported_intents": ["create", "show", "edit", "unknown"],
-       "supported_states": list(FlexibleConversationState.STATES.values()),
-       "flexibility_level": "maximum"
-   }
-# ═══════════════════════════════════════════════════════════════
-# ADDITIONAL UTILITY FUNCTIONS FOR ENHANCED FLEXIBILITY
-# ═══════════════════════════════════════════════════════════════
-def validate_template_structure(template: Dict[str, Any]) -> bool:
-   """Validate template structure for safety"""
-   required_keys = ["name", "goal", "days"]
-   return all(key in template for key in required_keys)
-def sanitize_user_input(text: str) -> str:
-   """Sanitize user input while preserving natural language flexibility"""
-   # Remove potentially harmful characters but keep natural language intact
-   sanitized = re.sub(r'[<>{}[\]\\]', '', text)
-   # Preserve emojis and natural punctuation
-   sanitized = re.sub(r'\s+', ' ', sanitized).strip()
-   return sanitized[:1000]  # Reasonable length limit
-class ConversationLogger:
-   """Log conversation flows for debugging and improvement"""
-
-   @staticmethod
-   def determine_next_state(
-    current_state: str,
-    user_input: str,
-    user_intent: str,
-    intent_confidence: float,
-    context: Optional[Dict] = None
-) -> str:
-    """Ultra-flexible state determination with context awareness"""
-    
-    # Global overrides - users can jump to any state anytime
-    if user_intent == "create" and intent_confidence > 0.3:
-        return FlexibleConversationState.STATES["FETCH_PROFILE"]
-    elif user_intent == "show" and intent_confidence > 0.25:
-        return "SHOW_TEMPLATE"  # Special handling
-    elif user_intent == "edit" and intent_confidence > 0.2:
-        return FlexibleConversationState.STATES["APPLY_EDIT"]
-    
-    # Context-aware state progression
-    if current_state == FlexibleConversationState.STATES["START"]:
-        return FlexibleConversationState.STATES["FETCH_PROFILE"]
-        
-    elif current_state == FlexibleConversationState.STATES["FETCH_PROFILE"]:
-        return FlexibleConversationState.STATES["ASK_DAYS"]
-        
-    elif current_state == FlexibleConversationState.STATES["ASK_DAYS"]:
-        # CRITICAL FIX: Only advance if we actually extracted valid day information
-        extracted_days = UltraFlexibleParser.extract_days_count(user_input)
-        context_days = context.get('profile', {}).get('days_count') if context else None
-        
-        # Only proceed if we have a valid number (not None and > 0)
-        if (extracted_days is not None and extracted_days > 0) or (context_days is not None and context_days > 0):
-            return FlexibleConversationState.STATES["ASK_NAMES"]
-        return current_state  # Stay in ASK_DAYS and ask again
-        
-    elif current_state == FlexibleConversationState.STATES["ASK_NAMES"]:
-        # Only proceed to generation if user provided actual names (not just days)
-        days_keywords = ['day', 'days', 'workout', 'week', 'time']
-        is_days_input = any(keyword in user_input.lower() for keyword in days_keywords)
-
-        # Check for "nothing" type responses that should use defaults
-        nothing_keywords = ['nothing', 'no', 'skip', 'default', 'defaults', 'normal', 'standard', 'none', 'nope', 'nah']
-        is_nothing_response = user_input.strip().lower() in nothing_keywords
-
-        if not is_days_input and (user_input.strip() == "" or len(user_input.strip()) > 2 or is_nothing_response):
-            return FlexibleConversationState.STATES["DRAFT_GENERATION"]
-        return current_state  # Stay and wait for proper workout names
-        
-    elif current_state == FlexibleConversationState.STATES["DRAFT_GENERATION"]:
-        return FlexibleConversationState.STATES["EDIT_DECISION"]
-        
-    elif current_state == FlexibleConversationState.STATES["EDIT_DECISION"]:
-        # Check for explicit save commands first
-        save_commands = ['save', 'save it', 'store', 'store it', 'keep', 'keep it', 'perfect', 'looks good', 'good to go']
-        if any(cmd in user_input.lower() for cmd in save_commands):
-            return FlexibleConversationState.STATES["CONFIRM_SAVE"]
-        elif UltraFlexibleParser.is_positive_response(user_input) or user_intent == "edit":
-            return FlexibleConversationState.STATES["APPLY_EDIT"]
-        elif UltraFlexibleParser.is_negative_response(user_input):
-            return FlexibleConversationState.STATES["CONFIRM_SAVE"]
-        else:
-            # Treat unclear responses as edit requests
-            return FlexibleConversationState.STATES["APPLY_EDIT"]
-            
-    elif current_state == FlexibleConversationState.STATES["APPLY_EDIT"]:
-        return FlexibleConversationState.STATES["EDIT_DECISION"]
-        
-    elif current_state == FlexibleConversationState.STATES["CONFIRM_SAVE"]:
-        if UltraFlexibleParser.is_positive_response(user_input):
-            return FlexibleConversationState.STATES["DONE"]
-        elif UltraFlexibleParser.is_negative_response(user_input):
-            return FlexibleConversationState.STATES["EDIT_DECISION"]
-        else:
-            # Unclear response - treat as edit request
-            return FlexibleConversationState.STATES["APPLY_EDIT"]
-    
-    return current_state
-  
-   @staticmethod
-   def log_transition(user_id: int, from_state: str, to_state: str,
-                     user_input: str, intent: str, confidence: float):
-       print(f"🔄 USER {user_id}: {from_state} → {to_state}")
-       print(f"   Input: '{user_input[:50]}{'...' if len(user_input) > 50 else ''}'")
-       print(f"   Intent: {intent} (confidence: {confidence:.2f})")
-  
-   @staticmethod
-   def log_parsing_result(user_input: str, parsing_results: Dict[str, Any]):
-       print(f"🔍 PARSING: '{user_input}'")
-       print(f"   Results: {parsing_results}")
