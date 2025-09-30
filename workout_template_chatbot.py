@@ -286,6 +286,190 @@ def _ensure_unique_exercise_ids(template: dict) -> dict:
     return template
 
 
+def _generate_template_name_from_days(template_days: dict) -> str:
+    """Generate meaningful template name based on day titles and muscle groups"""
+    if not template_days:
+        return "Custom Workout"
+
+    day_titles = []
+    muscle_groups_summary = []
+
+    for day_key, day_data in template_days.items():
+        if isinstance(day_data, dict):
+            # Get title or generate from muscle groups
+            title = day_data.get('title', '')
+            muscle_groups = day_data.get('muscle_groups', [])
+
+            if title and title not in day_titles:
+                day_titles.append(title)
+
+            # Collect muscle groups
+            for muscle in muscle_groups:
+                if muscle not in muscle_groups_summary:
+                    muscle_groups_summary.append(muscle)
+
+    # Create template name based on collected information
+    day_count = len(template_days)
+
+    # If we have clear muscle group patterns, use them
+    if muscle_groups_summary:
+        # Check for common split patterns
+        muscle_set = set(mg.lower() for mg in muscle_groups_summary)
+
+        if {'push', 'pull', 'legs'}.issubset(muscle_set):
+            return f"Push Pull Legs ({day_count} Days)"
+        elif {'upper body', 'lower body'}.issubset(muscle_set) or \
+             ({'chest', 'back', 'shoulders'}.intersection(muscle_set) and 'legs' in muscle_set):
+            return f"Upper Lower Split ({day_count} Days)"
+        elif 'full body' in muscle_set:
+            return f"Full Body Workout ({day_count} Days)"
+        elif len(muscle_groups_summary) == 1:
+            return f"{muscle_groups_summary[0].title()} Focus ({day_count} Days)"
+        else:
+            # Use first few muscle groups
+            primary_muscles = muscle_groups_summary[:2]
+            return f"{' & '.join(mg.title() for mg in primary_muscles)} Split ({day_count} Days)"
+
+    # Fallback to day titles if available
+    if day_titles and len(day_titles) <= 3:
+        unique_titles = [title for title in day_titles if title not in ['Day 1', 'Day 2', 'Day 3', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']]
+        if unique_titles:
+            return f"{' & '.join(unique_titles)} ({day_count} Days)"
+
+    # Ultimate fallback
+    return f"Custom Workout ({day_count} Days)"
+
+
+def _is_custom_title(title: str, day_key: str, muscle_groups: list) -> bool:
+    """Check if the title is a custom user-set title vs auto-generated"""
+    if not title:
+        return False
+
+    # Standard auto-generated titles to ignore
+    standard_titles = {
+        'day 1', 'day 2', 'day 3', 'day 4', 'day 5', 'day 6', 'day 7',
+        'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
+        'chest', 'back', 'legs', 'shoulders', 'arms', 'core', 'biceps', 'triceps',
+        'upper body', 'lower body', 'full body', 'push', 'pull',
+        'chest day', 'back day', 'leg day', 'shoulder day', 'arm day'
+    }
+
+    title_lower = title.lower().strip()
+
+    # If title matches standard formats, it's not custom
+    if title_lower in standard_titles:
+        return False
+
+    # If title matches day key format, it's not custom
+    if title_lower == day_key.replace('_', ' ').lower():
+        return False
+
+    # Check if it's just a muscle group name
+    if muscle_groups:
+        muscle_names = [mg.lower() for mg in muscle_groups]
+        if title_lower in muscle_names:
+            return False
+
+        # Check if it's auto-generated from muscle groups
+        auto_generated = _generate_day_title_from_muscle_groups(muscle_groups, 1, "").lower()
+        if title_lower == auto_generated:
+            return False
+
+    # If none of the above, it's likely a custom title
+    return True
+
+
+def _generate_day_title_from_muscle_groups(muscle_groups: list, day_number: int, fallback_name: str = "") -> str:
+    """Generate attractive day title based on muscle groups"""
+    if not muscle_groups:
+        return fallback_name if fallback_name else f"Day {day_number}"
+
+    # Convert muscle groups to user-friendly names
+    muscle_map = {
+        'chest': 'Chest',
+        'back': 'Back',
+        'legs': 'Legs',
+        'leg': 'Legs',
+        'shoulders': 'Shoulders',
+        'shoulder': 'Shoulders',
+        'arms': 'Arms',
+        'arm': 'Arms',
+        'biceps': 'Biceps',
+        'triceps': 'Triceps',
+        'core': 'Core',
+        'abs': 'Abs',
+        'abdominal': 'Abs',
+        'cardio': 'Cardio',
+        'quadriceps': 'Legs',
+        'hamstrings': 'Legs',
+        'glutes': 'Legs',
+        'calves': 'Legs',
+        'upper body': 'Upper Body',
+        'lower body': 'Lower Body',
+        'full body': 'Full Body',
+        'push': 'Push',
+        'pull': 'Pull'
+    }
+
+    # Map muscle groups to friendly names
+    friendly_names = []
+    for muscle in muscle_groups:
+        muscle_lower = muscle.lower().strip()
+        friendly_name = muscle_map.get(muscle_lower, muscle.title())
+        if friendly_name not in friendly_names:
+            friendly_names.append(friendly_name)
+
+    # Create title based on muscle groups
+    if len(friendly_names) == 1:
+        title = friendly_names[0]
+    elif len(friendly_names) == 2:
+        title = f"{friendly_names[0]} & {friendly_names[1]}"
+    elif len(friendly_names) >= 3:
+        # For 3+ muscle groups, show "Upper Body" or "Full Body"
+        upper_muscles = {'Chest', 'Back', 'Shoulders', 'Arms', 'Biceps', 'Triceps'}
+        lower_muscles = {'Legs', 'Glutes'}
+
+        has_upper = any(name in upper_muscles for name in friendly_names)
+        has_lower = any(name in lower_muscles for name in friendly_names)
+
+        if has_upper and has_lower:
+            title = "Full Body"
+        elif has_upper:
+            title = "Upper Body"
+        elif has_lower:
+            title = "Lower Body"
+        else:
+            title = " & ".join(friendly_names[:2])  # Show first 2
+    else:
+        title = fallback_name if fallback_name else f"Day {day_number}"
+
+    return title
+
+
+def _clean_markdown_for_message(markdown_text: str) -> str:
+    """Remove markdown formatting symbols (* and #) from text for clean message display"""
+    if not markdown_text:
+        return ""
+
+    # Remove markdown headers (# symbols)
+    lines = markdown_text.split('\n')
+    cleaned_lines = []
+
+    for line in lines:
+        # Remove # from headers but keep the text
+        if line.strip().startswith('#'):
+            # Remove all # and clean up spacing
+            clean_line = line.lstrip('#').strip()
+            if clean_line:
+                cleaned_lines.append(clean_line)
+        else:
+            # Remove bold/italic markdown (* symbols)
+            clean_line = line.replace('**', '').replace('*', '')
+            cleaned_lines.append(clean_line)
+
+    return '\n'.join(cleaned_lines)
+
+
 def _format_template_for_display(template: dict) -> str:
     """Format template for frontend display with enhanced styling and emojis"""
     if not template or not template.get('days'):
@@ -303,28 +487,30 @@ def _format_template_for_display(template: dict) -> str:
         if not isinstance(day_data, dict):
             continue
 
-        # Get the title from the template data
+        # Get title directly from template - don't hardcode anything
         title = day_data.get('title', '')
 
         # Create comprehensive day header with emojis
         day_emoji = _get_day_emoji(day_count)
 
+        # Use the title from template exactly as it is
         if title:
-            # Use the custom title which may include custom day names
-            if "—" in title or ":" in title:
-                combined_title = f"{day_emoji} Day {day_count}: {title} {day_emoji}"
-            else:
-                combined_title = f"{day_emoji} Day {day_count}: {title} {day_emoji}"
+            combined_title = f"{day_emoji} Day {day_count} - {title}"
         else:
-            # Fallback to cleaned up key name
-            clean_title = day_key.replace('_', ' ').title()
-            combined_title = f"{day_emoji} Day {day_count}: {clean_title} {day_emoji}"
+            # Fallback only if no title exists
+            combined_title = f"{day_emoji} Day {day_count}"
 
         formatted_lines.append(combined_title)
-        formatted_lines.append("─" * (len(combined_title) - 4))  # Adjust for emoji length
+        formatted_lines.append("─" * (len(combined_title) - 2))  # Adjust for emoji length
         formatted_lines.append("")
 
-        # Add exercises with better formatting
+        # Add muscle groups if available
+        muscle_groups = day_data.get('muscle_groups', [])
+        if muscle_groups:
+            formatted_lines.append(f"🎯 Muscle Focus: {', '.join(muscle_groups)}")
+            formatted_lines.append("")
+
+        # Add exercises with only name, sets, reps (as requested)
         exercises = day_data.get('exercises', [])
         if exercises:
             for i, exercise in enumerate(exercises, 1):
@@ -333,8 +519,10 @@ def _format_template_for_display(template: dict) -> str:
                     sets = exercise.get('sets', 0)
                     reps = exercise.get('reps', 0)
                     exercise_emoji = _get_exercise_emoji(name)
+
                     formatted_lines.append(f"   {exercise_emoji} {i}. {name}")
-                    formatted_lines.append(f"      📊 {sets} sets × {reps} reps")
+                    if sets and reps:
+                        formatted_lines.append(f"      📊 {sets} sets × {reps} reps")
                     formatted_lines.append("")
         else:
             formatted_lines.append("   ⚠️ No exercises added yet")
@@ -350,11 +538,8 @@ def _format_template_for_display(template: dict) -> str:
 
 def _get_day_emoji(day_num: int) -> str:
     """Get emoji based on day number"""
-    day_emojis = {
-        1: "🔥", 2: "💥", 3: "⚡", 4: "🚀",
-        5: "💪", 6: "🎯", 7: "🌟"
-    }
-    return day_emojis.get(day_num, "💫")
+    day_emojis = ["💥", "🔥", "⚡", "🚀", "💪", "🎯", "🌟"]
+    return day_emojis[(day_num - 1) % len(day_emojis)]
 
 def _get_exercise_emoji(exercise_name: str) -> str:
     """Get relevant emoji based on exercise type"""
@@ -1607,7 +1792,7 @@ async def ultra_flexible_workout_stream(
                    "template_json": tpl,
                    "template_ids": tpl_ids,
                    "why": "Generated based on your profile",
-                   "message": f"Here's your personalized workout template:\n\n{md}"
+                   "message": f"Here's your personalized workout template:\n\n{_clean_markdown_for_message(md)}"
                })
 
                # Add the follow-up question like the working version
@@ -1730,7 +1915,7 @@ async def ultra_flexible_workout_stream(
                            "template_markdown": md,
                            "template_json": new_tpl,
                            "template_ids": tpl_ids,
-                           "message": f"Great! I've made that change:\n\n{md}",
+                           "message": f"Great! I've made that change:\n\n{_clean_markdown_for_message(md)}",
                            "why": summary or "Applied your requested change"
                        })
 
@@ -1765,7 +1950,7 @@ async def ultra_flexible_workout_stream(
                    yield _evt({
                        "type": "workout_template",
                        "status": "ask_for_edits",
-                       "message": "What would you like to change? You can say things like:\n• 'Change day name from Monday to Push Day'\n• 'Add more chest exercises'\n• 'Remove squats and add lunges'\n• 'Make it easier'"
+                       "message": "What would you like to change? You can say things like:\n• 'Change day 1 name to Lion'\n• 'Rename Monday to Beast Mode'\n• 'Call day 2 Thunder'\n• 'Add more chest exercises'\n• 'Remove squats and add lunges'\n• 'Make it easier'"
                    })
                    yield "event: done\ndata: [DONE]\n\n"
 
@@ -1855,7 +2040,8 @@ async def ultra_flexible_workout_stream(
 
     if ai_analysis.get("positive_sentiment") or user_intent in ["save", "yes"] or user_input.lower().strip() in ['save', 'yes', 'confirm']:
         # Save the template
-        template_name = tpl.get("name") or f"Custom Workout ({', '.join(prof.get('template_names', ['Multi-Day']))})"
+        # Generate intelligent template name
+        template_name = tpl.get("name") or _generate_template_name_from_days(tpl.get("days", {}))
 
         async def _final_save():
             # Validate template before saving
@@ -1906,17 +2092,19 @@ async def ultra_flexible_workout_stream(
                     id_map = _fetch_qr_rows(db, all_ids)
 
                     results = []
-                    for day in per_day_ids.keys():
-                        day_ids = per_day_ids.get(day, [])
+                    for day_key in per_day_ids.keys():
+                        day_ids = per_day_ids.get(day_key, [])
                         if day_ids:  # Only process days with exercises
                             payload = _build_day_payload(day_ids, id_map)
                             if payload:  # Only save if payload has content
                                 try:
-                                    result = _persist_payload(db, user_id, day, payload)
+                                    # Use title from template instead of day_key
+                                    day_title = tpl_with_ids.get("days", {}).get(day_key, {}).get("title", day_key)
+                                    result = _persist_payload(db, user_id, day_title, payload)
                                     results.append(result)
-                                    print(f"✅ Saved structured data for day: {day}")
+                                    print(f"✅ Saved structured data for day: {day_title} (key: {day_key})")
                                 except Exception as persist_error:
-                                    print(f"⚠️ Failed to persist day {day}: {persist_error}")
+                                    print(f"⚠️ Failed to persist day {day_key}: {persist_error}")
 
                     # Commit all changes
                     if results:
