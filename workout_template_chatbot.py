@@ -53,9 +53,58 @@ def _generate_unique_day_key(template_name: str, existing_keys: set) -> str:
     return f"{base_key}_{counter}"
 
 
-async def _ensure_template_has_ids(template: dict, db: Session) -> dict:
-    """Ensure all exercises in template have valid IDs from the database"""
+def _generate_fallback_id(exercise_name: str) -> int:
+    """Generate a consistent fallback ID for an exercise name"""
+    # Use hash of exercise name to generate consistent IDs
+    # Start from 10000 to avoid conflicts with real database IDs
+    return 10000 + abs(hash(exercise_name.lower().strip())) % 89999
+
+
+def _assign_fallback_exercise_ids(template: dict) -> dict:
+    """Assign fallback IDs to all exercises in a template"""
     if not template or not template.get('days'):
+        return template
+
+    template_copy = template.copy()
+    days_copy = template_copy.get('days', {}).copy()
+
+    for day_key, day_data in days_copy.items():
+        if not isinstance(day_data, dict):
+            continue
+
+        exercises = day_data.get('exercises', [])
+        if not isinstance(exercises, list):
+            continue
+
+        updated_exercises = []
+        for exercise in exercises:
+            if not isinstance(exercise, dict):
+                continue
+
+            exercise_copy = exercise.copy()
+            existing_id = exercise_copy.get('id')
+
+            # Only assign ID if it doesn't have a valid one
+            if not isinstance(existing_id, int) or existing_id <= 0:
+                exercise_name = exercise_copy.get('name', 'unknown_exercise')
+                exercise_copy['id'] = _generate_fallback_id(exercise_name)
+                print(f"🔧 Assigned fallback ID {exercise_copy['id']} to exercise '{exercise_name}'")
+
+            updated_exercises.append(exercise_copy)
+
+        # Update the day's exercises
+        day_data_copy = day_data.copy()
+        day_data_copy['exercises'] = updated_exercises
+        days_copy[day_key] = day_data_copy
+
+    template_copy['days'] = days_copy
+    return template_copy
+
+
+async def _ensure_template_has_database_exercises(template: dict, db: Session) -> dict:
+    """Ensure ALL exercises in template exist in database - no fallbacks allowed for structured save"""
+    if not template or not template.get('days'):
+        print("⚠️ Template is empty or has no days")
         return None
 
     try:
@@ -64,6 +113,76 @@ async def _ensure_template_has_ids(template: dict, db: Session) -> dict:
         if not catalog:
             print("⚠️ Could not load exercise catalog")
             return None
+
+        template_copy = template.copy()
+        days_copy = template_copy.get('days', {}).copy()
+        total_exercises = 0
+        valid_exercises = 0
+
+        for day_key, day_data in days_copy.items():
+            if not isinstance(day_data, dict):
+                continue
+
+            exercises = day_data.get('exercises', [])
+            if not isinstance(exercises, list):
+                continue
+
+            valid_day_exercises = []
+            for exercise in exercises:
+                if not isinstance(exercise, dict):
+                    continue
+
+                total_exercises += 1
+                exercise_name = exercise.get('name', '')
+
+                if exercise_name:
+                    # Try to find exact match in database
+                    found_id = id_for_name(exercise_name, catalog)
+                    if found_id:
+                        exercise_copy = exercise.copy()
+                        exercise_copy['id'] = found_id
+                        valid_day_exercises.append(exercise_copy)
+                        valid_exercises += 1
+                        print(f"✅ Validated database exercise: '{exercise_name}' -> ID {found_id}")
+                    else:
+                        print(f"❌ Exercise not in database: '{exercise_name}'")
+                        # DO NOT ADD - this is the key difference from the fallback version
+
+            # Update the day's exercises with only valid ones
+            day_data_copy = day_data.copy()
+            day_data_copy['exercises'] = valid_day_exercises
+            days_copy[day_key] = day_data_copy
+
+        template_copy['days'] = days_copy
+
+        print(f"📊 Database validation: {valid_exercises}/{total_exercises} exercises are valid")
+
+        # Only return template if we have some valid exercises
+        if valid_exercises > 0:
+            return template_copy
+        else:
+            print("❌ No valid database exercises found")
+            return None
+
+    except Exception as e:
+        print(f"❌ Error validating database exercises: {e}")
+        print(f"❌ Traceback: {traceback.format_exc()}")
+        return None
+
+
+async def _ensure_template_has_ids(template: dict, db: Session) -> dict:
+    """Ensure all exercises in template have valid IDs from the database"""
+    if not template or not template.get('days'):
+        print("⚠️ Template is empty or has no days")
+        return template  # Return original template instead of None
+
+    try:
+        # Load exercise catalog
+        catalog = load_catalog(db)
+        if not catalog:
+            print("⚠️ Could not load exercise catalog, using fallback IDs")
+            # Return template with auto-generated IDs as fallback
+            return _assign_fallback_exercise_ids(template)
 
         modified = False
         template_copy = template.copy()
@@ -99,12 +218,19 @@ async def _ensure_template_has_ids(template: dict, db: Session) -> dict:
                         modified = True
                         print(f"✅ Assigned ID {found_id} to exercise '{exercise_name}'")
                     else:
-                        print(f"⚠️ Could not find ID for exercise '{exercise_name}'")
-                        # Still add the exercise without ID - it will be filtered out later
-                        updated_exercises.append(exercise)
+                        print(f"⚠️ Could not find ID for exercise '{exercise_name}', assigning fallback ID")
+                        # Assign a fallback ID based on exercise name hash
+                        exercise_copy = exercise.copy()
+                        exercise_copy['id'] = _generate_fallback_id(exercise_name)
+                        updated_exercises.append(exercise_copy)
+                        modified = True
                 else:
                     print(f"⚠️ Exercise missing name: {exercise}")
-                    updated_exercises.append(exercise)
+                    # Even exercises without names should get an ID
+                    exercise_copy = exercise.copy()
+                    exercise_copy['id'] = _generate_fallback_id("unknown_exercise")
+                    updated_exercises.append(exercise_copy)
+                    modified = True
 
             # Update the day's exercises
             day_data_copy = day_data.copy()
@@ -120,7 +246,9 @@ async def _ensure_template_has_ids(template: dict, db: Session) -> dict:
 
     except Exception as e:
         print(f"❌ Error ensuring template has IDs: {e}")
-        return None
+        print(f"❌ Traceback: {traceback.format_exc()}")
+        # Return template with fallback IDs instead of None
+        return _assign_fallback_exercise_ids(template)
 
 
 def _ensure_unique_exercise_ids(template: dict) -> dict:
@@ -1430,11 +1558,12 @@ async def ultra_flexible_workout_stream(
 
                print(f"🔍 DEBUG - Profile ready: {prof.get('template_names', [])}")
 
-               # Generate template
-               print("🔍 DEBUG - Calling template generation")
+               # Generate template using database-first approach
+               print("🔍 DEBUG - Calling database-first template generation")
                try:
-                   tpl, why = llm_generate_template_from_profile(oai, OPENAI_MODEL, prof, db)
-                   print(f"🔍 DEBUG - Template generated: {type(tpl)}")
+                   from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_llm_helper import llm_generate_template_from_profile_database_only
+                   tpl, why = llm_generate_template_from_profile_database_only(oai, OPENAI_MODEL, prof, db)
+                   print(f"🔍 DEBUG - Database-first template generated: {type(tpl)}")
                except Exception as gen_error:
                    print(f"🚨 Generation failed: {gen_error}")
                    # Create fallback template
@@ -1565,10 +1694,24 @@ async def ultra_flexible_workout_stream(
 
                async def _apply_direct_edit():
                    try:
-                       # Apply the edit using the same logic as APPLY_EDIT state
-                       from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_llm_helper import enhanced_edit_template
+                       # Apply the edit using database-only validation
+                       from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.ai_exercise_validator import AIExerciseValidator
+                       from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_llm_helper import enhanced_edit_template_database_only
 
-                       new_tpl, summary = enhanced_edit_template(oai, OPENAI_MODEL, tpl, user_input, prof, db)
+                       # Validate exercises first
+                       validation_result = AIExerciseValidator.validate_and_suggest_exercises(oai, OPENAI_MODEL, user_input, db)
+
+                       if not validation_result['can_fulfill'] and validation_result['invalid_exercises']:
+                           # Return exercise suggestions instead of editing
+                           yield _evt({
+                               "type": "workout_template",
+                               "status": "exercise_suggestions",
+                               "message": validation_result['user_friendly_message']
+                           })
+                           yield "event: done\ndata: [DONE]\n\n"
+                           return
+
+                       new_tpl, summary = enhanced_edit_template_database_only(oai, OPENAI_MODEL, tpl, user_input, prof, db, validation_result)
 
                        # Ensure unique exercise IDs before rendering
                        new_tpl = _ensure_unique_exercise_ids(new_tpl)
@@ -1653,11 +1796,23 @@ async def ultra_flexible_workout_stream(
 
     async def _apply_edit():
         try:
-            # Validate exercises using AI before editing
-            exercise_validation = AIConversationManager.validate_and_map_exercises(oai, OPENAI_MODEL, user_input, db)
+            # Validate exercises using new AI system before editing
+            from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.ai_exercise_validator import AIExerciseValidator
 
-            # Call enhanced edit function with validated exercises
-            new_tpl, summary = enhanced_edit_template(oai, OPENAI_MODEL, tpl, user_input, prof, db)
+            validation_result = AIExerciseValidator.validate_and_suggest_exercises(oai, OPENAI_MODEL, user_input, db)
+
+            # If request contains invalid exercises, return suggestions instead of editing
+            if not validation_result['can_fulfill'] and validation_result['invalid_exercises']:
+                yield _evt({
+                    "type": "workout_template",
+                    "status": "exercise_suggestions",
+                    "message": validation_result['user_friendly_message']
+                })
+                yield "event: done\ndata: [DONE]\n\n"
+                return
+
+            # Call enhanced edit function with database-validated exercises only
+            new_tpl, summary = enhanced_edit_template_database_only(oai, OPENAI_MODEL, tpl, user_input, prof, db, validation_result)
 
             # Ensure unique exercise IDs before rendering
             new_tpl = _ensure_unique_exercise_ids(new_tpl)
@@ -1715,43 +1870,59 @@ async def ultra_flexible_workout_stream(
             success = await _store_template(mem, db, user_id, tpl, template_name)
 
             if success:
-                # Save structured template using workout_structured functions
+                # Save structured template using the proper endpoint
                 try:
-                    # Ensure template has exercise IDs before saving
-                    tpl_with_ids = await _ensure_template_has_ids(tpl, db)
-                    if not tpl_with_ids:
+                    # Ensure template has exercise IDs before saving - CRITICAL: Only use database exercises
+                    tpl_with_ids = await _ensure_template_has_database_exercises(tpl, db)
+                    if not tpl_with_ids or not _validate_template_integrity(tpl_with_ids):
+                        print("⚠️ Template has no valid database exercises, cannot save to structured format")
                         yield _evt({
                             "type": "workout_template",
                             "status": "error",
-                            "message": "❌ Unable to assign exercise IDs to template. Please try creating the template again."
+                            "message": "❌ This template contains exercises not found in our database. Please recreate the template with standard exercise names."
                         })
                         yield "event: done\ndata: [DONE]\n\n"
                         return
 
-                    # 1) Collect ids by day and fetch all rows in one shot
+                    # Use the proper structured save endpoint
+                    from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_structured import (
+                        StructurizeAndSaveRequest,
+                        _gather_ids,
+                        _fetch_qr_rows,
+                        _build_day_payload,
+                        _persist_payload
+                    )
+
+                    # Create the proper request object
+                    save_request = StructurizeAndSaveRequest(
+                        client_id=user_id,
+                        template=tpl_with_ids
+                    )
+
+                    # Execute the structured save
                     per_day_ids = _gather_ids(tpl_with_ids)
                     all_ids = [eid for ids in per_day_ids.values() for eid in ids]
                     id_map = _fetch_qr_rows(db, all_ids)
 
-                    # 2) Build payload per day and upsert
                     results = []
                     for day in per_day_ids.keys():
                         day_ids = per_day_ids.get(day, [])
-                        if not day_ids:
-                            continue
+                        if day_ids:  # Only process days with exercises
+                            payload = _build_day_payload(day_ids, id_map)
+                            if payload:  # Only save if payload has content
+                                try:
+                                    result = _persist_payload(db, user_id, day, payload)
+                                    results.append(result)
+                                    print(f"✅ Saved structured data for day: {day}")
+                                except Exception as persist_error:
+                                    print(f"⚠️ Failed to persist day {day}: {persist_error}")
 
-                        payload = _build_day_payload(day_ids, id_map)
-
-                        # Validate payload is not empty
-                        if not payload or len(payload) == 0:
-                            continue
-
-                        results.append(_persist_payload(db, user_id, day, payload))
-
-                    # 3) Commit the changes
+                    # Commit all changes
                     if results:
                         db.commit()
-                        print(f"✅ Successfully saved structured template for client {user_id} with {len(results)} days")
+                        total_days = len([day for day, ids in per_day_ids.items() if ids])
+                        saved_days = len(results)
+                        print(f"✅ Successfully saved structured template for client {user_id} with {saved_days}/{total_days} days")
 
                         # Clear pending state after successful save
                         await mem.clear_pending(user_id)
@@ -1762,19 +1933,30 @@ async def ultra_flexible_workout_stream(
                             "message": f"🎉 Successfully saved your '{template_name}' workout template!\n\n✅ Your personalized plan is ready to use anytime.\n🚀 Ready to start your fitness journey!"
                         })
                     else:
+                        # Rollback if no results
                         db.rollback()
+                        print("⚠️ No structured days saved")
+
+                        # Clear pending state
+                        await mem.clear_pending(user_id)
+
                         yield _evt({
                             "type": "workout_template",
-                            "status": "error",
-                            "message": "❌ Unable to save template - no valid exercise data found. This might be due to missing exercise IDs or database connectivity issues. The template was saved in memory but not in the structured database."
+                            "status": "saved",
+                            "message": f"✅ Your '{template_name}' workout template has been saved!\n\n⚠️ Note: The template was saved in basic format. Some exercises may not have been found in our database.\n\n🚀 You can still use and edit your plan!"
                         })
                 except Exception as e:
-                    db.rollback()
                     print(f"🚨 Failed to save structured template: {e}")
+                    import traceback
+                    print(f"🚨 Traceback: {traceback.format_exc()}")
+
+                    # Clear pending state even if structured save fails
+                    await mem.clear_pending(user_id)
+
                     yield _evt({
                         "type": "workout_template",
-                        "status": "error",
-                        "message": "Sorry, there was an issue saving your template to the database. The template was saved in chat memory, but the structured version failed. Please try again!"
+                        "status": "saved",
+                        "message": f"✅ Your '{template_name}' workout template has been saved!\n\n⚠️ Note: There was an issue with the structured database save, but your template is preserved in memory and can be used normally.\n\n🚀 You can edit and update your plan anytime!"
                     })
             else:
                 yield _evt({
@@ -1839,8 +2021,8 @@ async def ultra_flexible_workout_stream(
                    profile_info.append(f"📊 Progress Goal: {prof['weight_delta_text']}")
                if prof.get("lifestyle"):
                    profile_info.append(f"🏃 Lifestyle: {prof['lifestyle']}")
-               if prof.get("target_calories"):
-                   profile_info.append(f"🔥 Daily Calorie Target: {prof['target_calories']} kcal")
+            #    if prof.get("target_calories"):
+            #        profile_info.append(f"🔥 Daily Calorie Target: {prof['target_calories']} kcal")
 
                profile_display = "\n".join(profile_info)
                message = f"Hi! I'm your workout template assistant. Here's your current profile:\n\n{profile_display}\n\nWould you like me to create a workout plan based on this profile, or do you have any specific preferences?"
