@@ -1357,8 +1357,8 @@ async def ultra_flexible_workout_stream(
                 profile_info.append(f"📊 Progress Goal: {prof['weight_delta_text']}")
             if prof.get("lifestyle"):
                 profile_info.append(f"🏃 Lifestyle: {prof['lifestyle']}")
-            if prof.get("target_calories"):
-                profile_info.append(f"🔥 Daily Calorie Target: {prof['target_calories']} kcal")
+            # if prof.get("target_calories"):
+            #     profile_info.append(f"🔥 Daily Calorie Target: {prof['target_calories']} kcal")
 
             profile_display = "\n".join(profile_info)
 
@@ -1798,6 +1798,7 @@ async def ultra_flexible_workout_stream(
         try:
             # Validate exercises using new AI system before editing
             from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.ai_exercise_validator import AIExerciseValidator
+            from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_llm_helper import enhanced_edit_template_database_only
 
             validation_result = AIExerciseValidator.validate_and_suggest_exercises(oai, OPENAI_MODEL, user_input, db)
 
