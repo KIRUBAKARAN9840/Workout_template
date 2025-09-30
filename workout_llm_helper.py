@@ -1268,6 +1268,752 @@ def generate_system_prompt(template_names: list) -> str:
         "- Use common gym names; system will map to a fixed exercise catalog.\n"
         "- No markdown, ONLY JSON."
     )
+
+def llm_generate_template_from_profile_database_only(oai, model: str, profile: Dict[str,Any], db: Session) -> Tuple[Dict[str,Any], str]:
+    """Generate template using ONLY database exercises - new database-first approach"""
+    print("🔍 DEBUG - Using database-first template generation")
+
+    try:
+        from .database_exercise_manager import DatabaseExerciseManager
+
+        # Extract profile information
+        template_names = profile.get("template_names", ["Day 1", "Day 2", "Day 3"])
+        template_count = len(template_names)
+        goal = profile.get("client_goal", "muscle gain")
+
+        # Define muscle group mappings for different goals
+        muscle_group_programs = {
+            "muscle gain": ["chest", "back", "legs", "shoulders", "biceps", "triceps"],
+            "weight loss": ["full body", "cardio", "legs", "core"],
+            "strength": ["chest", "back", "legs", "shoulders"],
+            "endurance": ["cardio", "full body", "legs", "core"]
+        }
+
+        # Get appropriate muscle groups for the goal
+        target_muscle_groups = muscle_group_programs.get(goal.lower(), ["chest", "back", "legs", "shoulders"])
+
+        # Create template structure
+        template = {
+            "name": f"Database-First {template_count}-Day Program",
+            "goal": goal,
+            "days": {}
+        }
+
+        # Generate exercises for each day
+        for i, day_name in enumerate(template_names):
+            day_key = day_name.lower().replace(' ', '_').replace('-', '_')
+
+            # Assign muscle groups cyclically
+            assigned_muscle_groups = []
+            exercises_per_day = max(3, 6 // template_count)  # At least 3 exercises per day
+
+            if template_count <= len(target_muscle_groups):
+                # One muscle group per day
+                muscle_group = target_muscle_groups[i % len(target_muscle_groups)]
+                assigned_muscle_groups = [muscle_group]
+            else:
+                # Multiple muscle groups per day
+                groups_per_day = max(1, len(target_muscle_groups) // template_count)
+                start_idx = (i * groups_per_day) % len(target_muscle_groups)
+                assigned_muscle_groups = target_muscle_groups[start_idx:start_idx + groups_per_day]
+
+            # Get exercises from database for these muscle groups
+            day_exercises = []
+            for muscle_group in assigned_muscle_groups:
+                muscle_exercises = DatabaseExerciseManager.get_available_exercises_by_muscle(db, muscle_group)
+
+                # Select exercises for this muscle group
+                exercises_for_muscle = min(exercises_per_day // len(assigned_muscle_groups) + 1, len(muscle_exercises))
+                selected_exercises = muscle_exercises[:exercises_for_muscle]
+
+                for exercise in selected_exercises:
+                    # Add default sets/reps
+                    exercise_copy = exercise.copy()
+                    if exercise.get('isCardio'):
+                        exercise_copy['sets'] = 1
+                        exercise_copy['reps'] = '20 minutes'
+                    else:
+                        exercise_copy['sets'] = 3
+                        exercise_copy['reps'] = 12 if exercise.get('isBodyWeight') else 10
+
+                    day_exercises.append(exercise_copy)
+
+            # Ensure minimum exercises per day
+            while len(day_exercises) < 3:
+                # Add more exercises from any available muscle group
+                additional_muscle = target_muscle_groups[len(day_exercises) % len(target_muscle_groups)]
+                additional_exercises = DatabaseExerciseManager.get_available_exercises_by_muscle(db, additional_muscle)
+
+                if additional_exercises:
+                    # Find an exercise not already in the day
+                    existing_names = [ex['name'] for ex in day_exercises]
+                    for exercise in additional_exercises:
+                        if exercise['name'] not in existing_names:
+                            exercise_copy = exercise.copy()
+                            exercise_copy['sets'] = 3
+                            exercise_copy['reps'] = 12 if exercise.get('isBodyWeight') else 10
+                            day_exercises.append(exercise_copy)
+                            break
+                else:
+                    break  # No more exercises available
+
+            template["days"][day_key] = {
+                "title": day_name.title(),
+                "muscle_groups": assigned_muscle_groups,
+                "exercises": day_exercises[:6]  # Limit to 6 exercises per day
+            }
+
+            print(f"📝 Day {i+1} ({day_name}): {len(day_exercises)} database exercises")
+
+        return template, "Generated using only database exercises"
+
+    except Exception as e:
+        print(f"❌ Database-first generation failed: {e}")
+        # Return empty template rather than fallback
+        return {
+            "name": "Empty Template",
+            "goal": "muscle gain",
+            "days": {}
+        }, f"Generation failed: {e}"
+
+
+def enhanced_edit_template_database_only(oai, model: str, template: Dict[str, Any], user_instruction: str, profile: Dict[str, Any], db: Session, validation_result: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
+    """Enhanced edit function that handles all editing scenarios with database-only exercises"""
+    print("🔍 DEBUG - Using comprehensive database-only template editing")
+    print(f"🔍 DEBUG - User instruction: '{user_instruction}'")
+    print(f"🔍 DEBUG - Template structure keys: {list(template.keys())}")
+    print(f"🔍 DEBUG - Days in template: {list(template.get('days', {}).keys())}")
+
+    try:
+        from .database_exercise_manager import DatabaseExerciseManager
+        from .ai_exercise_validator import AIExerciseValidator
+
+        # Make a deep copy of the template to work with
+        new_template = template.copy()
+        new_template['days'] = {}
+        for day_key, day_data in template.get('days', {}).items():
+            new_template['days'][day_key] = day_data.copy()
+            if 'exercises' in day_data:
+                new_template['days'][day_key]['exercises'] = [ex.copy() for ex in day_data['exercises']]
+
+        edit_summary = []
+        instruction_lower = user_instruction.lower()
+
+        # Parse the instruction using AI to understand intent
+        editing_intent = _parse_editing_intent(oai, model, user_instruction)
+        print(f"🔍 DEBUG - Parsed intent: {editing_intent}")
+
+        # Track if any changes were made
+        changes_made = False
+
+        # 1. Handle day name changes (priority check for rename patterns)
+        if editing_intent.get('action') == 'rename_day' or any(phrase in instruction_lower for phrase in ['rename', 'change day', 'change name', 'call day']):
+            result = _handle_day_rename(new_template, user_instruction, editing_intent)
+            if result['success']:
+                edit_summary.append(result['message'])
+                changes_made = True
+            else:
+                edit_summary.append(result['message'])
+
+        # 2. Handle exercise addition to specific days or all days
+        elif editing_intent.get('action') == 'add_exercise' or any(word in instruction_lower for word in ['add', 'include', 'give me', 'more']):
+            if validation_result.get('validated_exercises'):
+                result = _handle_exercise_addition(new_template, user_instruction, validation_result['validated_exercises'], editing_intent)
+                edit_summary.extend(result['messages'])
+                if result['messages']:
+                    changes_made = True
+            else:
+                # Handle muscle group requests
+                result = _handle_muscle_group_addition(new_template, user_instruction, db, oai, model, editing_intent)
+                edit_summary.extend(result['messages'])
+                if result['messages']:
+                    changes_made = True
+
+        # 3. Handle exercise replacement/alternation
+        elif editing_intent.get('action') == 'replace_exercise' or any(word in instruction_lower for word in ['replace', 'swap', 'alternate']) or ('change' in instruction_lower and any(word in instruction_lower for word in ['exercise', 'with', 'to'])):
+            result = _handle_exercise_replacement(new_template, user_instruction, validation_result, db, oai, model, editing_intent)
+            edit_summary.extend(result['messages'])
+            if result['messages']:
+                changes_made = True
+
+        # 4. Handle exercise removal
+        elif editing_intent.get('action') == 'remove_exercise' or any(word in instruction_lower for word in ['remove', 'delete', 'take out']):
+            result = _handle_exercise_removal(new_template, user_instruction, editing_intent)
+            edit_summary.extend(result['messages'])
+            if result['messages']:
+                changes_made = True
+
+        # 5. Handle day modifications (make harder, easier, etc.)
+        elif editing_intent.get('action') == 'modify_difficulty' or any(word in instruction_lower for word in ['harder', 'easier', 'more reps', 'less reps']):
+            result = _handle_difficulty_modification(new_template, user_instruction, editing_intent)
+            edit_summary.extend(result['messages'])
+            if result['messages']:
+                changes_made = True
+
+        # 6. If no specific edits were made, provide guidance
+        if not edit_summary:
+            edit_summary.append("I understand you want to make changes. Could you be more specific? For example: 'add bench press to all days', 'change Monday to Push Day', 'replace squats with lunges', etc.")
+
+        # Final validation - ensure all exercises are still from database
+        final_template = _validate_final_template_exercises(new_template, db)
+
+        # Ensure the template maintains proper structure for dynamic day key storage
+        final_template = _ensure_template_structure_compatibility(final_template)
+
+        print(f"🔍 DEBUG - Changes made: {changes_made}")
+        print(f"🔍 DEBUG - Final template days: {list(final_template.get('days', {}).keys())}")
+
+        return final_template, '; '.join(edit_summary)
+
+    except Exception as e:
+        print(f"❌ Database-only edit failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return template, f"Edit failed: {e}"
+
+
+def _parse_editing_intent(oai, model: str, user_instruction: str) -> Dict[str, Any]:
+    """Use AI to parse the user's editing intent"""
+    system_prompt = """You are parsing workout template editing instructions. Determine the user's intent and extract key information.
+
+    ACTIONS:
+    - "add_exercise": User wants to add exercises
+    - "remove_exercise": User wants to remove exercises
+    - "replace_exercise": User wants to replace/swap exercises
+    - "rename_day": User wants to change day names
+    - "modify_difficulty": User wants to change difficulty/reps/sets
+    - "unknown": Intent unclear
+
+    TARGETS:
+    - "all_days": Apply to all days
+    - "specific_day": Apply to specific day
+    - "muscle_group": Target specific muscle group
+
+    Extract:
+    - target_day: specific day mentioned (if any)
+    - exercise_names: specific exercises mentioned
+    - muscle_groups: muscle groups mentioned
+    - new_name: new name for day (if renaming)
+    - scope: "all" or "specific"
+
+    Respond in JSON: {"action": "...", "target": "...", "target_day": "...", "exercise_names": [...], "muscle_groups": [...], "new_name": "...", "scope": "..."}"""
+
+    try:
+        resp = oai.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Parse this instruction: '{user_instruction}'"}
+            ],
+            temperature=0.1
+        )
+
+        import json
+        result = json.loads(resp.choices[0].message.content or "{}")
+        return result
+
+    except Exception as e:
+        print(f"AI intent parsing failed: {e}")
+        # Fallback parsing
+        return _fallback_parse_intent(user_instruction)
+
+
+def _fallback_parse_intent(user_instruction: str) -> Dict[str, Any]:
+    """Enhanced fallback intent parsing using patterns"""
+    instruction_lower = user_instruction.lower()
+
+    # Determine action with more nuanced patterns
+    if any(word in instruction_lower for word in ['rename', 'call']) or \
+       ('change' in instruction_lower and any(word in instruction_lower for word in ['day', 'name'])) or \
+       ('day' in instruction_lower and 'should be' in instruction_lower):
+        action = 'rename_day'
+    elif any(word in instruction_lower for word in ['add', 'include', 'more', 'give', 'want']) and \
+         not ('remove' in instruction_lower or 'delete' in instruction_lower):
+        action = 'add_exercise'
+    elif any(word in instruction_lower for word in ['remove', 'delete', 'take out', 'hate']) or \
+         ('get rid' in instruction_lower):
+        action = 'remove_exercise'
+    elif any(word in instruction_lower for word in ['replace', 'swap', 'substitute', 'alternate', 'switch']) or \
+         ('change' in instruction_lower and any(word in instruction_lower for word in ['with', 'to', 'for'])):
+        action = 'replace_exercise'
+    elif any(word in instruction_lower for word in ['harder', 'easier', 'difficult', 'intense']) or \
+         ('make' in instruction_lower and any(word in instruction_lower for word in ['better', 'tougher'])):
+        action = 'modify_difficulty'
+    else:
+        action = 'unknown'
+
+    # Determine scope with more patterns
+    scope = 'all' if any(phrase in instruction_lower for phrase in [
+        'all days', 'every day', 'each day', 'all of them', 'everywhere'
+    ]) else 'specific'
+
+    # Extract potential day references
+    target_day = None
+    day_patterns = {
+        'day 1': 'day_1', 'day 2': 'day_2', 'day 3': 'day_3',
+        'monday': 'monday', 'tuesday': 'tuesday', 'wednesday': 'wednesday',
+        'thursday': 'thursday', 'friday': 'friday', 'saturday': 'saturday', 'sunday': 'sunday'
+    }
+
+    for pattern, normalized in day_patterns.items():
+        if pattern in instruction_lower:
+            target_day = pattern
+            break
+
+    # Extract potential new name for renaming
+    new_name = None
+    if action == 'rename_day':
+        import re
+        name_patterns = [
+            r'name as ([^\.]+)',
+            r'to ([^\.]+)',
+            r'call.*?([^\.]+)',
+            r'should be ([^\.]+)'
+        ]
+        for pattern in name_patterns:
+            match = re.search(pattern, instruction_lower)
+            if match:
+                new_name = match.group(1).strip()
+                break
+
+    return {
+        'action': action,
+        'scope': scope,
+        'target_day': target_day,
+        'exercise_names': [],
+        'muscle_groups': [],
+        'new_name': new_name
+    }
+
+
+def _handle_day_rename(template: Dict[str, Any], user_instruction: str, intent: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle day renaming requests"""
+    import re
+
+    print(f"🔍 DEBUG - Day rename request: '{user_instruction}'")
+    print(f"🔍 DEBUG - Intent data: {intent}")
+
+    # First try to use the parsed intent
+    old_name = intent.get('target_day', '')
+    new_name = intent.get('new_name', '')
+
+    # If intent parsing didn't work, fall back to regex patterns
+    if not old_name or not new_name:
+        rename_patterns = [
+            r'rename\s+([^t]+)\s+to\s+([^\.]+)',
+            r'change\s+([^t]+)\s+to\s+([^\.]+)',
+            r'call\s+([^a]+)\s+([^\.]+)',
+            r'change\s+([^n]+)\s+name\s+(?:as|to)\s+([^\.]+)',
+        ]
+
+        for pattern in rename_patterns:
+            match = re.search(pattern, user_instruction.lower())
+            if match:
+                old_name = match.group(1).strip()
+                new_name = match.group(2).strip()
+                break
+
+    if not old_name or not new_name:
+        return {'success': False, 'message': 'Could not understand which day to rename. Try: "rename Monday to Push Day"'}
+
+    print(f"🔍 DEBUG - Extracted: old_name='{old_name}', new_name='{new_name}'")
+
+    # Find the day to rename - handle both "day 2" and "day_2" formats
+    day_keys = list(template['days'].keys())
+    target_day_key = None
+
+    print(f"🔍 DEBUG - Available day keys: {day_keys}")
+
+    # Normalize the old_name for comparison
+    old_name_normalized = old_name.lower().strip()
+
+    for day_key in day_keys:
+        day_title = template['days'][day_key].get('title', '').lower()
+        day_key_lower = day_key.lower()
+
+        print(f"🔍 DEBUG - Checking day_key='{day_key}' (title='{day_title}') against '{old_name_normalized}'")
+
+        # Check various matching patterns
+        matches = [
+            old_name_normalized in day_key_lower,
+            old_name_normalized in day_title,
+            old_name_normalized.replace(' ', '_') == day_key_lower,
+            old_name_normalized.replace('_', ' ') in day_key_lower.replace('_', ' '),
+            # Handle "day 2" -> "day_2" conversion
+            old_name_normalized.replace(' ', '_') in day_key_lower,
+            # Handle numeric day references like "day 2" -> "day_2"
+            f"day_{old_name_normalized.split()[-1]}" == day_key_lower if 'day' in old_name_normalized else False,
+        ]
+
+        if any(matches):
+            target_day_key = day_key
+            print(f"🔍 DEBUG - Found matching day: {day_key}")
+            break
+
+    if target_day_key:
+        # Rename the day
+        template['days'][target_day_key]['title'] = new_name.title()
+        print(f"🔍 DEBUG - Successfully renamed {target_day_key} to '{new_name.title()}'")
+        return {'success': True, 'message': f"Renamed {old_name} to {new_name.title()}"}
+    else:
+        print(f"🔍 DEBUG - Could not find day to rename")
+        return {'success': False, 'message': f"Could not find day '{old_name}' to rename"}
+
+
+def _handle_exercise_addition(template: Dict[str, Any], user_instruction: str, validated_exercises: List[Dict], intent: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle adding exercises to days"""
+    messages = []
+    instruction_lower = user_instruction.lower()
+
+    print(f"🔍 DEBUG - Exercise addition: '{user_instruction}'")
+    print(f"🔍 DEBUG - Validated exercises: {[ex.get('name') for ex in validated_exercises]}")
+    print(f"🔍 DEBUG - Template days: {list(template['days'].keys())}")
+
+    # Determine if adding to all days or specific day
+    add_to_all = any(phrase in instruction_lower for phrase in ['all days', 'every day', 'each day', 'to all'])
+
+    # Find specific day if mentioned
+    target_day = None
+    for day_key in template['days'].keys():
+        if day_key.lower() in instruction_lower or template['days'][day_key].get('title', '').lower() in instruction_lower:
+            target_day = day_key
+            break
+
+    print(f"🔍 DEBUG - Add to all: {add_to_all}, Target day: {target_day}")
+
+    if add_to_all:
+        # Add to all days
+        for exercise_data in validated_exercises:
+            for day_key, day_data in template['days'].items():
+                current_exercises = day_data.get('exercises', [])
+
+                # Check if exercise already exists in this day
+                exercise_exists = any(ex.get('name', '').lower() == exercise_data['name'].lower() for ex in current_exercises)
+
+                if not exercise_exists:
+                    new_exercise = exercise_data.copy()
+                    new_exercise['sets'] = 3
+                    new_exercise['reps'] = 12 if exercise_data.get('isBodyWeight') else 10
+                    current_exercises.append(new_exercise)
+                    template['days'][day_key]['exercises'] = current_exercises
+                    print(f"🔍 DEBUG - Added {exercise_data['name']} to {day_key}")
+
+            messages.append(f"Added {exercise_data['name']} to all days")
+
+    elif target_day:
+        # Add to specific day
+        for exercise_data in validated_exercises:
+            current_exercises = template['days'][target_day].get('exercises', [])
+
+            # Check if exercise already exists
+            exercise_exists = any(ex.get('name', '').lower() == exercise_data['name'].lower() for ex in current_exercises)
+
+            if not exercise_exists:
+                new_exercise = exercise_data.copy()
+                new_exercise['sets'] = 3
+                new_exercise['reps'] = 12 if exercise_data.get('isBodyWeight') else 10
+                current_exercises.append(new_exercise)
+                template['days'][target_day]['exercises'] = current_exercises
+                messages.append(f"Added {exercise_data['name']} to {template['days'][target_day].get('title', target_day)}")
+                print(f"🔍 DEBUG - Added {exercise_data['name']} to {target_day}")
+            else:
+                messages.append(f"{exercise_data['name']} already exists in {template['days'][target_day].get('title', target_day)}")
+
+    else:
+        # Add to first day as default
+        day_keys = list(template['days'].keys())
+        if day_keys:
+            target_day = day_keys[0]
+            for exercise_data in validated_exercises:
+                current_exercises = template['days'][target_day].get('exercises', [])
+                new_exercise = exercise_data.copy()
+                new_exercise['sets'] = 3
+                new_exercise['reps'] = 12 if exercise_data.get('isBodyWeight') else 10
+                current_exercises.append(new_exercise)
+                template['days'][target_day]['exercises'] = current_exercises
+                messages.append(f"Added {exercise_data['name']} to {template['days'][target_day].get('title', target_day)}")
+                print(f"🔍 DEBUG - Added {exercise_data['name']} to {target_day} (default)")
+
+    print(f"🔍 DEBUG - Addition results: {messages}")
+    return {'messages': messages}
+
+
+def _handle_muscle_group_addition(template: Dict[str, Any], user_instruction: str, db: Session, oai, model: str, intent: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle adding exercises by muscle group"""
+    from .ai_exercise_validator import AIExerciseValidator
+    messages = []
+    instruction_lower = user_instruction.lower()
+
+    # Extract muscle groups
+    muscle_groups = ['chest', 'back', 'legs', 'shoulders', 'arms', 'core', 'biceps', 'triceps', 'abs']
+    found_muscles = [muscle for muscle in muscle_groups if muscle in instruction_lower]
+
+    if not found_muscles:
+        return {'messages': ['Could not identify which muscle group exercises to add']}
+
+    # Determine if adding to all days
+    add_to_all = any(phrase in instruction_lower for phrase in ['all days', 'every day', 'each day', 'to all'])
+
+    for muscle in found_muscles:
+        suggested_exercises = AIExerciseValidator.suggest_muscle_group_exercises(oai, model, muscle, db, count=2)
+
+        if suggested_exercises:
+            if add_to_all:
+                # Add to all days
+                for day_key, day_data in template['days'].items():
+                    current_exercises = day_data.get('exercises', [])
+                    for exercise in suggested_exercises:
+                        # Check if exercise already exists
+                        exercise_exists = any(ex.get('name', '').lower() == exercise['name'].lower() for ex in current_exercises)
+                        if not exercise_exists:
+                            new_exercise = exercise.copy()
+                            new_exercise['sets'] = 3
+                            new_exercise['reps'] = 12 if exercise.get('isBodyWeight') else 10
+                            current_exercises.append(new_exercise)
+                    template['days'][day_key]['exercises'] = current_exercises
+
+                exercise_names = [ex['name'] for ex in suggested_exercises]
+                messages.append(f"Added {muscle} exercises ({', '.join(exercise_names)}) to all days")
+            else:
+                # Add to first day
+                day_keys = list(template['days'].keys())
+                if day_keys:
+                    target_day = day_keys[0]
+                    current_exercises = template['days'][target_day].get('exercises', [])
+                    for exercise in suggested_exercises:
+                        new_exercise = exercise.copy()
+                        new_exercise['sets'] = 3
+                        new_exercise['reps'] = 12 if exercise.get('isBodyWeight') else 10
+                        current_exercises.append(new_exercise)
+                    template['days'][target_day]['exercises'] = current_exercises
+
+                    exercise_names = [ex['name'] for ex in suggested_exercises]
+                    messages.append(f"Added {muscle} exercises: {', '.join(exercise_names)}")
+
+    return {'messages': messages}
+
+
+def _handle_exercise_replacement(template: Dict[str, Any], user_instruction: str, validation_result: Dict, db: Session, oai, model: str, intent: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle exercise replacement requests"""
+    from .ai_exercise_validator import AIExerciseValidator
+    messages = []
+
+    print(f"🔍 DEBUG - Exercise replacement: '{user_instruction}'")
+
+    # Extract what to replace and what to replace with
+    import re
+    replacement_patterns = [
+        r'replace\s+([^w]+)\s+with\s+([^\.]+)',
+        r'change\s+([^t]+)\s+to\s+([^\.]+)',
+        r'swap\s+([^f]+)\s+for\s+([^\.]+)',
+        r'alternate\s+([^w]+)\s+with\s+([^\.]+)',
+        r'substitute\s+([^w]+)\s+with\s+([^\.]+)',
+    ]
+
+    target_exercise = None
+    replacement_exercise = None
+
+    for pattern in replacement_patterns:
+        match = re.search(pattern, user_instruction.lower())
+        if match:
+            target_exercise = match.group(1).strip()
+            replacement_exercise = match.group(2).strip()
+            break
+
+    print(f"🔍 DEBUG - Target: '{target_exercise}', Replacement: '{replacement_exercise}'")
+
+    if target_exercise and replacement_exercise:
+        # Validate replacement exercise
+        from .database_exercise_manager import DatabaseExerciseManager
+        exists, exercise_data = DatabaseExerciseManager.validate_exercise_exists(db, replacement_exercise)
+
+        if exists:
+            # Replace in all days where the target exercise is found
+            replaced_count = 0
+            for day_key, day_data in template['days'].items():
+                exercises = day_data.get('exercises', [])
+                for i, exercise in enumerate(exercises):
+                    if target_exercise.lower() in exercise.get('name', '').lower():
+                        # Replace the exercise
+                        new_exercise = exercise_data.copy()
+                        new_exercise['sets'] = exercise.get('sets', 3)
+                        new_exercise['reps'] = exercise.get('reps', 10)
+                        exercises[i] = new_exercise
+                        replaced_count += 1
+
+            if replaced_count > 0:
+                messages.append(f"Replaced {target_exercise} with {exercise_data['name']} in {replaced_count} location(s)")
+            else:
+                messages.append(f"Could not find '{target_exercise}' to replace")
+        else:
+            # Find similar exercises
+            similar = DatabaseExerciseManager.find_similar_exercises(db, replacement_exercise, limit=3)
+            if similar:
+                suggestions = [ex['name'] for ex in similar]
+                messages.append(f"'{replacement_exercise}' not found. Try: {', '.join(suggestions)}")
+            else:
+                messages.append(f"'{replacement_exercise}' not found in database")
+
+    return {'messages': messages}
+
+
+def _handle_exercise_removal(template: Dict[str, Any], user_instruction: str, intent: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle exercise removal requests"""
+    messages = []
+    instruction_lower = user_instruction.lower()
+
+    print(f"🔍 DEBUG - Exercise removal: '{user_instruction}'")
+
+    # Extract exercise to remove
+    import re
+    remove_patterns = [
+        r'remove\s+([^f]+?)(?:\s+from|\s*$)',
+        r'delete\s+([^f]+?)(?:\s+from|\s*$)',
+        r'take\s+out\s+([^f]+?)(?:\s+from|\s*$)',
+    ]
+
+    target_exercise = None
+    for pattern in remove_patterns:
+        match = re.search(pattern, instruction_lower)
+        if match:
+            target_exercise = match.group(1).strip()
+            break
+
+    # Check if removing from specific day
+    target_day = None
+    for day_key in template['days'].keys():
+        if day_key.lower() in instruction_lower or template['days'][day_key].get('title', '').lower() in instruction_lower:
+            target_day = day_key
+            break
+
+    print(f"🔍 DEBUG - Target exercise: '{target_exercise}', Target day: '{target_day}'")
+
+    if target_exercise:
+        removed_count = 0
+        days_to_process = [target_day] if target_day else list(template['days'].keys())
+
+        for day_key in days_to_process:
+            day_data = template['days'][day_key]
+            exercises = day_data.get('exercises', [])
+            original_count = len(exercises)
+
+            # Remove exercises that match
+            exercises = [ex for ex in exercises if target_exercise.lower() not in ex.get('name', '').lower()]
+            new_count = len(exercises)
+
+            if new_count < original_count:
+                template['days'][day_key]['exercises'] = exercises
+                removed_count += (original_count - new_count)
+                print(f"🔍 DEBUG - Removed {original_count - new_count} exercise(s) from {day_key}")
+
+        if removed_count > 0:
+            if target_day:
+                day_title = template['days'][target_day].get('title', target_day)
+                messages.append(f"Removed {target_exercise} from {day_title}")
+            else:
+                messages.append(f"Removed {target_exercise} from {removed_count} location(s)")
+        else:
+            messages.append(f"Could not find '{target_exercise}' to remove")
+    else:
+        messages.append("Could not understand which exercise to remove")
+
+    return {'messages': messages}
+
+
+def _handle_difficulty_modification(template: Dict[str, Any], user_instruction: str, intent: Dict[str, Any]) -> Dict[str, Any]:
+    """Handle difficulty modifications like making workouts harder/easier"""
+    messages = []
+    instruction_lower = user_instruction.lower()
+
+    if 'harder' in instruction_lower or 'more reps' in instruction_lower:
+        # Increase reps/sets
+        for day_key, day_data in template['days'].items():
+            for exercise in day_data.get('exercises', []):
+                if isinstance(exercise.get('reps'), int):
+                    exercise['reps'] = min(exercise['reps'] + 2, 20)  # Cap at 20
+                if isinstance(exercise.get('sets'), int):
+                    exercise['sets'] = min(exercise['sets'] + 1, 5)   # Cap at 5
+        messages.append("Made all exercises harder (increased reps and sets)")
+
+    elif 'easier' in instruction_lower or 'less reps' in instruction_lower:
+        # Decrease reps/sets
+        for day_key, day_data in template['days'].items():
+            for exercise in day_data.get('exercises', []):
+                if isinstance(exercise.get('reps'), int):
+                    exercise['reps'] = max(exercise['reps'] - 2, 5)   # Minimum 5
+                if isinstance(exercise.get('sets'), int):
+                    exercise['sets'] = max(exercise['sets'] - 1, 2)  # Minimum 2
+        messages.append("Made all exercises easier (decreased reps and sets)")
+
+    return {'messages': messages}
+
+
+def _validate_final_template_exercises(template: Dict[str, Any], db: Session) -> Dict[str, Any]:
+    """Final validation to ensure all exercises are from database"""
+    from .database_exercise_manager import DatabaseExerciseManager
+
+    for day_key, day_data in template['days'].items():
+        if isinstance(day_data, dict) and 'exercises' in day_data:
+            valid_exercises = []
+            for exercise in day_data['exercises']:
+                if exercise.get('id'):  # Already has database ID
+                    valid_exercises.append(exercise)
+                else:
+                    # Validate exercise is in database
+                    exists, validated_exercise = DatabaseExerciseManager.validate_exercise_exists(
+                        db, exercise.get('name', '')
+                    )
+                    if exists:
+                        validated_exercise['sets'] = exercise.get('sets', 3)
+                        validated_exercise['reps'] = exercise.get('reps', 10)
+                        valid_exercises.append(validated_exercise)
+                    else:
+                        print(f"⚠️ Filtering out invalid exercise: {exercise.get('name', 'Unknown')}")
+
+            day_data['exercises'] = valid_exercises
+
+    return template
+
+
+def _ensure_template_structure_compatibility(template: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure template structure is compatible with dynamic day key system"""
+    if not template or not isinstance(template, dict):
+        return template
+
+    days = template.get('days', {})
+    if not isinstance(days, dict):
+        return template
+
+    # Ensure each day has the required structure
+    for day_key, day_data in days.items():
+        if not isinstance(day_data, dict):
+            continue
+
+        # Ensure exercises is a list
+        if 'exercises' not in day_data:
+            day_data['exercises'] = []
+        elif not isinstance(day_data['exercises'], list):
+            day_data['exercises'] = []
+
+        # Ensure each exercise has proper structure
+        valid_exercises = []
+        for exercise in day_data['exercises']:
+            if isinstance(exercise, dict) and exercise.get('id') and exercise.get('name'):
+                # Ensure basic exercise properties
+                exercise_copy = exercise.copy()
+                exercise_copy.setdefault('sets', 3)
+                exercise_copy.setdefault('reps', 10)
+                valid_exercises.append(exercise_copy)
+
+        day_data['exercises'] = valid_exercises
+
+        # Ensure day has a title
+        if 'title' not in day_data or not day_data['title']:
+            day_data['title'] = day_key.title()
+
+    return template
+
+
 def llm_generate_template_from_profile(oai, model: str, profile: Dict[str,Any], db: Session) -> Tuple[Dict[str,Any], str]:
     print("🔍 DEBUG - Entered llm_generate_template_from_profile function")
 
@@ -2759,6 +3505,5 @@ def explain_template_with_llm(oai, model: str, profile: Dict[str,Any], template:
         return (resp.choices[0].message.content or "").strip()
     except Exception:
         return "Compound-first approach with weekly distribution tailored to your goal, experience, and Mon–Sat frequency."
-
 
 
