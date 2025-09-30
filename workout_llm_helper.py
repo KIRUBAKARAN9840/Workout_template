@@ -983,47 +983,210 @@ def is_workout_template_intent(t: str) -> bool:
     return any(k in tt for k in _TRIGGER_WORDS)
 # ────────────────────── RENDER (Markdown) ───────────────────
 def render_markdown_from_template(tpl: Dict[str,Any]) -> str:
-    """Render template with dynamic day names."""
-    name = tpl.get("name") or "Workout Template"
+    """Render template with dynamic day names and attractive formatting."""
+    name = tpl.get("name") or "💪 Your Workout Template"
     goal = (tpl.get("goal") or "").replace("_"," ").title()
     days  = tpl.get("days") or {}
     notes = tpl.get("notes") or []
+
+    # Start with attractive header
     out = [f"# {name}"]
     if goal:
-        out += [f"**Goal:** {goal}", ""]
+        out += [f"🎯 **Goal:** {goal}", ""]
+
     # Get all day keys from the template and sort them for consistent rendering
     day_keys = list(days.keys())
     # Try to maintain a sensible order if possible
     day_order = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
     day_keys.sort(key=lambda x: day_order.index(x) if x in day_order else len(day_order))
+
+    # Counter for day numbering
+    day_counter = 1
+
+    # Day emojis for visual appeal
+    day_emojis = ["💥", "🔥", "⚡", "🚀", "💪", "🎯", "🌟"]
+
     for d in day_keys:
         if d in days:
             day = days[d] or {}
             split_title = (day.get("title") or "").strip()
-            heading = f"{d.title()}" + (f" — {split_title}" if split_title else "")
-            out.append(f"## {heading}")
+
+            # Get emoji for this day
+            emoji = day_emojis[(day_counter - 1) % len(day_emojis)]
+
+            # Use title from template exactly as it is - don't hardcode anything
+            if split_title:
+                heading = f"{emoji} Day {day_counter} - {split_title}"
+            else:
+                # Fallback only if no title exists
+                heading = f"{emoji} Day {day_counter}"
+
             mgs = day.get("muscle_groups") or []
+
+            out.append(f"## {heading}")
+
             if mgs:
-                out.append(f"**Muscle Focus:** {', '.join(mgs)}")
-            for ex in day.get("exercises") or []:
-                nm   = ex.get("name") or "Exercise"
-                sets = ex.get("sets")
-                reps = ex.get("reps")
-                note = ex.get("note")
-                line = f"- {nm}"
-                if sets is not None and reps is not None:
-                    line += f" — {sets}×{reps}"
-                elif sets is not None:
-                    line += f" — {sets} sets"
-                if note:
-                    line += f" ({note})"
-                out.append(line)
-            out.append("")
+                out.append(f"🎯 **Muscle Focus:** {', '.join(mgs)}")
+                out.append("")
+
+            exercises = day.get("exercises") or []
+            if exercises:
+                for i, ex in enumerate(exercises, 1):
+                    nm   = ex.get("name") or "Exercise"
+                    sets = ex.get("sets")
+                    reps = ex.get("reps")
+
+                    # Add exercise emoji based on type
+                    exercise_emoji = _get_exercise_emoji_for_markdown(nm)
+                    line = f"{exercise_emoji} **{i}. {nm}**"
+
+                    if sets is not None and reps is not None:
+                        line += f" • {sets} sets × {reps} reps"
+                    elif sets is not None:
+                        line += f" • {sets} sets"
+
+                    out.append(line)
+                out.append("")
+            else:
+                out.append("⚠️ *No exercises added yet*")
+                out.append("")
+
+            day_counter += 1
+
     if notes:
-        out.append("**Notes**")
-        for n in notes: out.append(f"- {n}")
+        out.append("📝 **Additional Notes**")
+        for n in notes:
+            out.append(f"• {n}")
         out.append("")
+
     return "\n".join(out).strip()
+
+def _generate_day_title_from_muscle_groups(muscle_groups: list, day_number: int, fallback_name: str = "") -> str:
+    """Generate attractive day title based on muscle groups"""
+    if not muscle_groups:
+        return fallback_name if fallback_name else f"Day {day_number}"
+
+    # Convert muscle groups to user-friendly names
+    muscle_map = {
+        'chest': 'Chest',
+        'back': 'Back',
+        'legs': 'Legs',
+        'leg': 'Legs',
+        'shoulders': 'Shoulders',
+        'shoulder': 'Shoulders',
+        'arms': 'Arms',
+        'arm': 'Arms',
+        'biceps': 'Biceps',
+        'triceps': 'Triceps',
+        'core': 'Core',
+        'abs': 'Abs',
+        'abdominal': 'Abs',
+        'cardio': 'Cardio',
+        'quadriceps': 'Legs',
+        'hamstrings': 'Legs',
+        'glutes': 'Legs',
+        'calves': 'Legs',
+        'upper body': 'Upper Body',
+        'lower body': 'Lower Body',
+        'full body': 'Full Body',
+        'push': 'Push',
+        'pull': 'Pull'
+    }
+
+    # Map muscle groups to friendly names
+    friendly_names = []
+    for muscle in muscle_groups:
+        muscle_lower = muscle.lower().strip()
+        friendly_name = muscle_map.get(muscle_lower, muscle.title())
+        if friendly_name not in friendly_names:
+            friendly_names.append(friendly_name)
+
+    # Create title based on muscle groups
+    if len(friendly_names) == 1:
+        title = friendly_names[0]
+    elif len(friendly_names) == 2:
+        title = f"{friendly_names[0]} & {friendly_names[1]}"
+    elif len(friendly_names) >= 3:
+        # For 3+ muscle groups, show "Upper Body" or "Full Body"
+        upper_muscles = {'Chest', 'Back', 'Shoulders', 'Arms', 'Biceps', 'Triceps'}
+        lower_muscles = {'Legs', 'Glutes'}
+
+        has_upper = any(name in upper_muscles for name in friendly_names)
+        has_lower = any(name in lower_muscles for name in friendly_names)
+
+        if has_upper and has_lower:
+            title = "Full Body"
+        elif has_upper:
+            title = "Upper Body"
+        elif has_lower:
+            title = "Lower Body"
+        else:
+            title = " & ".join(friendly_names[:2])  # Show first 2
+    else:
+        title = fallback_name if fallback_name else f"Day {day_number}"
+
+    return title
+
+def _is_custom_title(title: str, day_key: str, muscle_groups: list) -> bool:
+    """Check if the title is a custom user-set title vs auto-generated"""
+    if not title:
+        return False
+
+    # Standard auto-generated titles to ignore
+    standard_titles = {
+        'day 1', 'day 2', 'day 3', 'day 4', 'day 5', 'day 6', 'day 7',
+        'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
+        'chest', 'back', 'legs', 'shoulders', 'arms', 'core', 'biceps', 'triceps',
+        'upper body', 'lower body', 'full body', 'push', 'pull',
+        'chest day', 'back day', 'leg day', 'shoulder day', 'arm day'
+    }
+
+    title_lower = title.lower().strip()
+
+    # If title matches standard formats, it's not custom
+    if title_lower in standard_titles:
+        return False
+
+    # If title matches day key format, it's not custom
+    if title_lower == day_key.replace('_', ' ').lower():
+        return False
+
+    # Check if it's just a muscle group name
+    if muscle_groups:
+        muscle_names = [mg.lower() for mg in muscle_groups]
+        if title_lower in muscle_names:
+            return False
+
+        # Check if it's auto-generated from muscle groups
+        auto_generated = _generate_day_title_from_muscle_groups(muscle_groups, 1, "").lower()
+        if title_lower == auto_generated:
+            return False
+
+    # If none of the above, it's likely a custom title
+    return True
+
+def _get_exercise_emoji_for_markdown(exercise_name: str) -> str:
+    """Get relevant emoji based on exercise type for markdown display"""
+    exercise_name_lower = exercise_name.lower()
+
+    if any(word in exercise_name_lower for word in ['squat', 'leg', 'deadlift', 'lunge']):
+        return "🦵"
+    elif any(word in exercise_name_lower for word in ['bench', 'press', 'chest', 'push']):
+        return "💪"
+    elif any(word in exercise_name_lower for word in ['pull', 'row', 'lat', 'back']):
+        return "🎣"
+    elif any(word in exercise_name_lower for word in ['shoulder', 'overhead', 'lateral']):
+        return "🤲"
+    elif any(word in exercise_name_lower for word in ['curl', 'bicep', 'arm']):
+        return "💪"
+    elif any(word in exercise_name_lower for word in ['tricep', 'dip', 'extension']):
+        return "💥"
+    elif any(word in exercise_name_lower for word in ['core', 'plank', 'abs', 'crunch']):
+        return "🔥"
+    elif any(word in exercise_name_lower for word in ['cardio', 'run', 'bike', 'treadmill']):
+        return "🏃"
+    else:
+        return "🏋️"
 # ─────────────────────── Utilities ──────────────────────────
 def _safe_json(text: str, fallback: Dict[str,Any]) -> Dict[str,Any]:
     try:
@@ -1330,8 +1493,11 @@ def llm_generate_template_from_profile_database_only(oai, model: str, profile: D
                 else:
                     break  # No more exercises available
 
+            # Generate better title based on assigned muscle groups
+            muscle_title = _generate_day_title_from_muscle_groups(assigned_muscle_groups, i + 1, day_name)
+
             template["days"][day_key] = {
-                "title": day_name.title(),
+                "title": muscle_title,
                 "muscle_groups": assigned_muscle_groups,
                 "exercises": day_exercises[:6]  # Limit to 6 exercises per day
             }
