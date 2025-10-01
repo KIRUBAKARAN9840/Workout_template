@@ -1061,6 +1061,28 @@ def render_markdown_from_template(tpl: Dict[str,Any]) -> str:
 
     return "\n".join(out).strip()
 
+def _normalize_exercise_name(exercise_name: str) -> str:
+    """Normalize exercise name to handle common spelling mistakes and variations"""
+    # Common spelling corrections
+    corrections = {
+        'dumbell': 'dumbbell',
+        'dumbbel': 'dumbbell',
+        'dumbel': 'dumbbell',
+        'inclined': 'incline',
+        'flyes': 'flys',
+        'raise': 'rise',
+        'bicep': 'biceps',
+        'tricep': 'triceps',
+        'calfs': 'calves',
+        'lat': 'lats'
+    }
+
+    normalized = exercise_name.lower()
+    for mistake, correction in corrections.items():
+        normalized = normalized.replace(mistake, correction)
+
+    return normalized
+
 def _generate_day_title_from_muscle_groups(muscle_groups: list, day_number: int, fallback_name: str = "") -> str:
     """Generate attractive day title based on muscle groups"""
     if not muscle_groups:
@@ -1493,11 +1515,12 @@ def llm_generate_template_from_profile_database_only(oai, model: str, profile: D
                 else:
                     break  # No more exercises available
 
-            # Generate better title based on assigned muscle groups
-            muscle_title = _generate_day_title_from_muscle_groups(assigned_muscle_groups, i + 1, day_name)
+            # Use the day name from template_names (AI-generated or user-specified)
+            # day_name comes from profile["template_names"] which contains the AI-generated names
+            day_title = day_name.title() if day_name else f"Day {i + 1}"
 
             template["days"][day_key] = {
-                "title": muscle_title,
+                "title": day_title,
                 "muscle_groups": assigned_muscle_groups,
                 "exercises": day_exercises[:6]  # Limit to 6 exercises per day
             }
@@ -1761,6 +1784,9 @@ def _handle_day_rename(template: Dict[str, Any], user_instruction: str, intent: 
             r'change\s+([^t]+)\s+to\s+([^\.]+)',
             r'call\s+([^a]+)\s+([^\.]+)',
             r'change\s+([^n]+)\s+name\s+(?:as|to)\s+([^\.]+)',
+            r'change\s+(day\s*\d+)\s+(?:as|to)\s+([^\.]+)',  # "change day 5 as brocode"
+            r'rename\s+(day\s*\d+)\s+(?:as|to)\s+([^\.]+)',  # "rename day 5 as brocode"
+            r'(day\s*\d+)\s+(?:as|to)\s+([^\.]+)',          # "day 5 as brocode"
         ]
 
         for pattern in rename_patterns:
@@ -1778,30 +1804,63 @@ def _handle_day_rename(template: Dict[str, Any], user_instruction: str, intent: 
     day_keys = list(template['days'].keys())
     target_day_key = None
 
+    print(f"🔍 Day rename debug - Looking for: '{old_name}' -> '{new_name}'")
+    print(f"🔍 Available day keys: {day_keys}")
+    for key in day_keys:
+        title = template['days'][key].get('title', '')
+        print(f"🔍 Day key '{key}' has title '{title}'")
 
     # Normalize the old_name for comparison
     old_name_normalized = old_name.lower().strip()
 
-    for day_key in day_keys:
-        day_title = template['days'][day_key].get('title', '').lower()
-        day_key_lower = day_key.lower()
+    # Convert written numbers to digits
+    number_words = {
+        'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+        'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
+        'first': 1, 'second': 2, 'third': 3, 'fourth': 4, 'fifth': 5,
+        'sixth': 6, 'seventh': 7, 'eighth': 8, 'ninth': 9, 'tenth': 10
+    }
 
+    # Special handling for "day X" format - match by position
+    day_number = None
+    if old_name_normalized.startswith('day '):
+        day_part = old_name_normalized.split()[-1]
+        if day_part.isdigit():
+            day_number = int(day_part)
+        elif day_part in number_words:
+            day_number = number_words[day_part]
+            print(f"🔍 Converted '{day_part}' to number: {day_number}")
 
-        # Check various matching patterns
-        matches = [
-            old_name_normalized in day_key_lower,
-            old_name_normalized in day_title,
-            old_name_normalized.replace(' ', '_') == day_key_lower,
-            old_name_normalized.replace('_', ' ') in day_key_lower.replace('_', ' '),
-            # Handle "day 2" -> "day_2" conversion
-            old_name_normalized.replace(' ', '_') in day_key_lower,
-            # Handle numeric day references like "day 2" -> "day_2"
-            f"day_{old_name_normalized.split()[-1]}" == day_key_lower if 'day' in old_name_normalized else False,
-        ]
+    if day_number is not None:
+        print(f"🔍 Detected day number: {day_number}")
+        if 1 <= day_number <= len(day_keys):
+            target_day_key = day_keys[day_number - 1]  # Convert to 0-based index
+            print(f"🔍 Matched day number {day_number} to key: {target_day_key}")
+        else:
+            print(f"🔍 Day number {day_number} out of range (max: {len(day_keys)})")
+    else:
+        # Original matching logic for named days
+        for day_key in day_keys:
+            day_title = template['days'][day_key].get('title', '').lower()
+            day_key_lower = day_key.lower()
 
-        if any(matches):
-            target_day_key = day_key
-            break
+            # Check various matching patterns
+            matches = [
+                old_name_normalized in day_key_lower,
+                old_name_normalized in day_title,
+                old_name_normalized.replace(' ', '_') == day_key_lower,
+                old_name_normalized.replace('_', ' ') in day_key_lower.replace('_', ' '),
+                # Handle "day 2" -> "day_2" conversion
+                old_name_normalized.replace(' ', '_') in day_key_lower,
+                # Handle numeric day references like "day 2" -> "day_2"
+                f"day_{old_name_normalized.split()[-1]}" == day_key_lower if 'day' in old_name_normalized else False,
+            ]
+
+            print(f"🔍 Checking day_key '{day_key}' (title: '{day_title}') - matches: {matches}")
+            if any(matches):
+                target_day_key = day_key
+                print(f"🔍 Found match: {target_day_key}")
+                break
 
     if target_day_key:
         # Rename the day
@@ -1931,8 +1990,21 @@ def _handle_muscle_group_addition(template: Dict[str, Any], user_instruction: st
             target_day = day_key
             break
 
+    # Extract number of exercises to add from user input
+    import re
+    number_match = re.search(r'\b(one|two|three|four|five|six|1|2|3|4|5|6)\b', instruction_lower)
+    exercise_count = 1  # Default to 1 exercise
+
+    if number_match:
+        number_text = number_match.group(1)
+        number_map = {
+            'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5, 'six': 6,
+            '1': 1, '2': 2, '3': 3, '4': 4, '5': 5, '6': 6
+        }
+        exercise_count = number_map.get(number_text, 1)
+
     for muscle in found_muscles:
-        suggested_exercises = AIExerciseValidator.suggest_muscle_group_exercises(oai, model, muscle, db, count=2)
+        suggested_exercises = AIExerciseValidator.suggest_muscle_group_exercises(oai, model, muscle, db, count=exercise_count)
 
         if suggested_exercises:
             if add_to_all:
@@ -1998,6 +2070,57 @@ def _handle_exercise_replacement(template: Dict[str, Any], user_instruction: str
     from .ai_exercise_validator import AIExerciseValidator
     messages = []
 
+    def _find_exact_exercise_match(target_name: str, template: dict) -> list:
+        """Use AI to find exact exercise matches in the template, avoiding partial matches"""
+        all_exercises = []
+        for day_key, day_data in template['days'].items():
+            for i, exercise in enumerate(day_data.get('exercises', [])):
+                all_exercises.append({
+                    'name': exercise.get('name', ''),
+                    'day_key': day_key,
+                    'index': i,
+                    'exercise': exercise
+                })
+
+        if not all_exercises:
+            return []
+
+        # Use AI to find the exact match
+        exercise_names = [ex['name'] for ex in all_exercises]
+        ai_prompt = f"""Find the exercise that best matches "{target_name}" from this list:
+{', '.join(exercise_names)}
+
+Rules:
+1. Look for exact or very close name matches
+2. Ignore minor spelling differences (dumbell vs dumbbell)
+3. Return ONLY the exact exercise name from the list that matches best
+4. If no good match exists, return "NO_MATCH"
+
+Target: {target_name}
+Response (exact name only):"""
+
+        try:
+            response = oai.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": ai_prompt}],
+                temperature=0.1,
+                max_tokens=50
+            )
+
+            ai_match = response.choices[0].message.content.strip()
+            print(f"🔍 AI exercise match: '{target_name}' -> '{ai_match}'")
+
+            if ai_match == "NO_MATCH":
+                return []
+
+            # Find all exercises that match the AI-selected name
+            matches = [ex for ex in all_exercises if ex['name'].lower() == ai_match.lower()]
+            return matches
+
+        except Exception as e:
+            print(f"AI exercise matching failed: {e}")
+            # Fallback to exact string matching
+            return [ex for ex in all_exercises if ex['name'].lower() == target_name.lower()]
 
     # Extract what to replace and what to replace with
     import re
@@ -2007,9 +2130,9 @@ def _handle_exercise_replacement(template: Dict[str, Any], user_instruction: str
         r'swap\s+(.+?)\s+for\s+(.+?)(?:\s|$)',
         r'alternate\s+(.+?)\s+with\s+(.+?)(?:\s|$)',
         r'substitute\s+(.+?)\s+with\s+(.+?)(?:\s|$)',
-        r'give\s+alternate\s+for\s+(.+?)(?:\s|$)',  # New pattern for "give alternate for X"
-        r'alternate\s+for\s+(.+?)(?:\s|$)',         # "alternate for X"
-        r'alternative\s+(?:for|to)\s+(.+?)(?:\s|$)', # "alternative for X"
+        r'give\s+alternate\s+for\s+(.+)$',  # Match everything after "give alternate for"
+        r'alternate\s+for\s+(.+)$',         # Match everything after "alternate for"
+        r'alternative\s+(?:for|to)\s+(.+)$', # Match everything after "alternative for/to"
     ]
 
     target_exercise = None
@@ -2020,6 +2143,7 @@ def _handle_exercise_replacement(template: Dict[str, Any], user_instruction: str
         match = re.search(pattern, user_instruction.lower())
         if match:
             target_exercise = match.group(1).strip()
+            print(f"🔍 Exercise replacement regex match: pattern {i} extracted '{target_exercise}' from '{user_instruction}'")
 
             # For "give alternate for X" patterns (indices 5, 6, 7), there's no replacement specified
             if i >= 5:  # These are the "give alternate" patterns
@@ -2030,96 +2154,113 @@ def _handle_exercise_replacement(template: Dict[str, Any], user_instruction: str
 
 
     if target_exercise and replacement_exercise:
-        # Validate replacement exercise
-        from .database_exercise_manager import DatabaseExerciseManager
-        exists, exercise_data = DatabaseExerciseManager.validate_exercise_exists(db, replacement_exercise)
+        # Use AI to find exact matches instead of substring matching
+        exercise_matches = _find_exact_exercise_match(target_exercise, template)
 
-        if exists:
-            # Replace in all days where the target exercise is found
-            replaced_count = 0
-            for day_key, day_data in template['days'].items():
-                exercises = day_data.get('exercises', [])
-                for i, exercise in enumerate(exercises):
-                    if target_exercise.lower() in exercise.get('name', '').lower():
-                        # Replace the exercise
-                        new_exercise = exercise_data.copy()
-                        new_exercise['sets'] = exercise.get('sets', 3)
-                        new_exercise['reps'] = exercise.get('reps', 10)
-                        exercises[i] = new_exercise
-                        replaced_count += 1
+        if exercise_matches:
+            # Validate replacement exercise
+            from .database_exercise_manager import DatabaseExerciseManager
+            exists, exercise_data = DatabaseExerciseManager.validate_exercise_exists(db, replacement_exercise)
 
-            if replaced_count > 0:
-                messages.append(f"Replaced {target_exercise} with {exercise_data['name']} in {replaced_count} location(s)")
+            if exists:
+                # Replace only the exact matches found by AI
+                replaced_count = 0
+                for match in exercise_matches:
+                    day_key = match['day_key']
+                    index = match['index']
+                    original_exercise = match['exercise']
+
+                    # Replace the exercise
+                    new_exercise = exercise_data.copy()
+                    new_exercise['sets'] = original_exercise.get('sets', 3)
+                    new_exercise['reps'] = original_exercise.get('reps', 10)
+                    template['days'][day_key]['exercises'][index] = new_exercise
+                    replaced_count += 1
+
+                if replaced_count > 0:
+                    messages.append(f"Replaced {exercise_matches[0]['name']} with {exercise_data['name']} in {replaced_count} location(s)")
+                else:
+                    messages.append(f"Could not find '{target_exercise}' to replace")
             else:
-                messages.append(f"Could not find '{target_exercise}' to replace")
+                # Find similar exercises
+                similar = DatabaseExerciseManager.find_similar_exercises(db, replacement_exercise, limit=3)
+                if similar:
+                    suggestions = [ex['name'] for ex in similar]
+                    messages.append(f"'{replacement_exercise}' not found. Try: {', '.join(suggestions)}")
+                else:
+                    messages.append(f"'{replacement_exercise}' not found in database")
         else:
-            # Find similar exercises
-            similar = DatabaseExerciseManager.find_similar_exercises(db, replacement_exercise, limit=3)
-            if similar:
-                suggestions = [ex['name'] for ex in similar]
-                messages.append(f"'{replacement_exercise}' not found. Try: {', '.join(suggestions)}")
-            else:
-                messages.append(f"'{replacement_exercise}' not found in database")
+            messages.append(f"Could not find '{target_exercise}' in your current template")
 
     elif target_exercise and not replacement_exercise:
         # Handle "give alternate for X" - actually replace with alternative from same muscle group
         from .database_exercise_manager import DatabaseExerciseManager
 
-        # First, find the target exercise to get its muscle group
-        exists, target_data = DatabaseExerciseManager.validate_exercise_exists(db, target_exercise)
-        if exists and 'muscle_group' in target_data:
-            muscle_group = target_data['muscle_group']
-            alternatives = DatabaseExerciseManager.get_available_exercises_by_muscle(db, muscle_group)
-            if alternatives:
-                # Filter out the target exercise itself
-                alternatives = [ex for ex in alternatives if ex.get('name', '').lower() != target_exercise.lower()]
+        # Use AI to find exact matches first
+        exercise_matches = _find_exact_exercise_match(target_exercise, template)
+
+        if exercise_matches:
+            # Get the muscle group of the target exercise
+            target_exercise_name = exercise_matches[0]['name']
+            exists, target_data = DatabaseExerciseManager.validate_exercise_exists(db, target_exercise_name)
+
+            if exists and 'muscle_group' in target_data:
+                muscle_group = target_data['muscle_group']
+                alternatives = DatabaseExerciseManager.get_available_exercises_by_muscle(db, muscle_group)
                 if alternatives:
-                    # Pick the first alternative and replace
-                    replacement_data = alternatives[0]
+                    # Filter out the target exercise itself
+                    alternatives = [ex for ex in alternatives if ex.get('name', '').lower() != target_exercise_name.lower()]
+                    if alternatives:
+                        # Pick the first alternative and replace only exact matches
+                        replacement_data = alternatives[0]
+                        replaced_count = 0
+
+                        for match in exercise_matches:
+                            day_key = match['day_key']
+                            index = match['index']
+                            original_exercise = match['exercise']
+
+                            # Replace with alternative from same muscle group
+                            new_exercise = replacement_data.copy()
+                            new_exercise['sets'] = original_exercise.get('sets', 3)
+                            new_exercise['reps'] = original_exercise.get('reps', 10)
+                            template['days'][day_key]['exercises'][index] = new_exercise
+                            replaced_count += 1
+
+                        if replaced_count > 0:
+                            messages.append(f"Replaced {target_exercise_name} with {replacement_data['name']} in {replaced_count} location(s)")
+                        else:
+                            messages.append(f"Could not find '{target_exercise}' to replace")
+                    else:
+                        messages.append(f"Could not find alternatives for {target_exercise_name}")
+                else:
+                    messages.append(f"Could not find alternatives for {target_exercise_name}")
+            else:
+                # Fallback: Find similar exercises by name
+                similar = DatabaseExerciseManager.find_similar_exercises(db, target_exercise_name, limit=5)
+                if similar:
+                    replacement_data = similar[0]
                     replaced_count = 0
 
-                    for day_key, day_data in template['days'].items():
-                        exercises = day_data.get('exercises', [])
-                        for i, exercise in enumerate(exercises):
-                            if target_exercise.lower() in exercise.get('name', '').lower():
-                                # Replace with alternative from same muscle group
-                                new_exercise = replacement_data.copy()
-                                new_exercise['sets'] = exercise.get('sets', 3)
-                                new_exercise['reps'] = exercise.get('reps', 10)
-                                exercises[i] = new_exercise
-                                replaced_count += 1
+                    for match in exercise_matches:
+                        day_key = match['day_key']
+                        index = match['index']
+                        original_exercise = match['exercise']
+
+                        new_exercise = replacement_data.copy()
+                        new_exercise['sets'] = original_exercise.get('sets', 3)
+                        new_exercise['reps'] = original_exercise.get('reps', 10)
+                        template['days'][day_key]['exercises'][index] = new_exercise
+                        replaced_count += 1
 
                     if replaced_count > 0:
-                        messages.append(f"Replaced {target_exercise} with {replacement_data['name']} in {replaced_count} location(s)")
+                        messages.append(f"Replaced {target_exercise_name} with {replacement_data['name']} in {replaced_count} location(s)")
                     else:
                         messages.append(f"Could not find '{target_exercise}' to replace")
                 else:
-                    messages.append(f"Could not find alternatives for {target_exercise}")
-            else:
-                messages.append(f"Could not find alternatives for {target_exercise}")
+                    messages.append(f"Could not find similar exercises for '{target_exercise_name}'")
         else:
-            # Fallback: Find similar exercises by name
-            similar = DatabaseExerciseManager.find_similar_exercises(db, target_exercise, limit=5)
-            if similar:
-                replacement_data = similar[0]
-                replaced_count = 0
-
-                for day_key, day_data in template['days'].items():
-                    exercises = day_data.get('exercises', [])
-                    for i, exercise in enumerate(exercises):
-                        if target_exercise.lower() in exercise.get('name', '').lower():
-                            new_exercise = replacement_data.copy()
-                            new_exercise['sets'] = exercise.get('sets', 3)
-                            new_exercise['reps'] = exercise.get('reps', 10)
-                            exercises[i] = new_exercise
-                            replaced_count += 1
-
-                if replaced_count > 0:
-                    messages.append(f"Replaced {target_exercise} with {replacement_data['name']} in {replaced_count} location(s)")
-                else:
-                    messages.append(f"Could not find '{target_exercise}' to replace")
-            else:
-                messages.append(f"Could not find '{target_exercise}' or alternatives")
+            messages.append(f"Could not find '{target_exercise}' in your current template")
 
     else:
         messages.append("Could not understand what to replace or what to replace it with")
@@ -2322,8 +2463,11 @@ def _ensure_template_structure_compatibility(template: Dict[str, Any]) -> Dict[s
 
         day_data['exercises'] = valid_exercises
 
-        # Generate meaningful title based on exercises
-        if 'title' not in day_data or not day_data['title'] or day_data['title'] == day_key.title():
+        # Only generate title if missing or clearly a placeholder - preserve custom user titles
+        if 'title' not in day_data or not day_data['title']:
+            day_data['title'] = _generate_meaningful_day_title(day_key, valid_exercises)
+        elif day_data['title'] == day_key.title() and day_key in ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']:
+            # Only auto-generate for weekday keys that still have default titles
             day_data['title'] = _generate_meaningful_day_title(day_key, valid_exercises)
 
     return template
@@ -3162,9 +3306,34 @@ def apply_manual_edit(template: Dict[str,Any], instruction: str, db: Session) ->
                 for i, exercise in enumerate(exercises):
                     exercise_name = exercise.get("name", "")
                     
-                    # Check if this is the exercise to replace
-                    if (target_exercise_name.lower() == exercise_name.lower() or
-                        calculate_similarity(target_exercise_name.lower(), exercise_name.lower()) > 0.8):
+                    # Check if this is the exercise to replace - be more precise
+                    # Normalize both names to handle spelling mistakes
+                    normalized_target = _normalize_exercise_name(target_exercise_name)
+                    normalized_exercise = _normalize_exercise_name(exercise_name)
+
+                    # First try exact match (with normalization)
+                    exact_match = normalized_target == normalized_exercise
+
+                    # Then try very high similarity for close matches (typos)
+                    high_similarity = calculate_similarity(normalized_target, normalized_exercise) > 0.9
+
+                    # For partial matches, require the target to be a significant part of the exercise name
+                    # and not just a word that appears in many exercises (like "dumbell")
+                    partial_match = False
+                    if not exact_match and not high_similarity:
+                        # Check if target is a substantial part of the exercise name
+                        target_words = set(target_exercise_name.lower().split())
+                        exercise_words = set(exercise_name.lower().split())
+
+                        # Avoid matching common words that appear in many exercises
+                        common_words = {'dumbell', 'dumbbell', 'barbell', 'machine', 'cable', 'seated', 'standing'}
+                        significant_words = target_words - common_words
+
+                        if significant_words:
+                            # Check if all significant words from target are in exercise name
+                            partial_match = significant_words.issubset(exercise_words) and len(significant_words) >= len(target_words) * 0.7
+
+                    if exact_match or high_similarity or partial_match:
                         
                         
                         # Get muscle groups for this day to find appropriate alternative
@@ -3255,9 +3424,31 @@ def apply_manual_edit(template: Dict[str,Any], instruction: str, db: Session) ->
                         else:
                             return template, f"No suitable alternative found for '{exercise_name}' (all similar exercises already in use)"
             
-            return template, f"Exercise '{target_exercise_name}' not found in current template"
+            # Exercise not found - try to find similar exercises in the template and suggest
+            all_exercise_names = []
+            for day_data in template["days"].values():
+                for ex in day_data.get("exercises", []):
+                    exercise_name = ex.get("name", "")
+                    if exercise_name:
+                        all_exercise_names.append(exercise_name)
+
+            # Find closest matches
+            suggestions = []
+            for ex_name in all_exercise_names:
+                similarity = calculate_similarity(target_exercise_name.lower(), ex_name.lower())
+                if similarity > 0.6:  # Lower threshold for suggestions
+                    suggestions.append((ex_name, similarity))
+
+            if suggestions:
+                # Sort by similarity and take top 3
+                suggestions.sort(key=lambda x: x[1], reverse=True)
+                suggestion_names = [s[0] for s in suggestions[:3]]
+                return template, f"Exercise '{target_exercise_name}' not found. Did you mean: {', '.join(suggestion_names)}?"
+            else:
+                return template, f"Exercise '{target_exercise_name}' not found in current template. Please check the exercise name and try again."
         else:
-            return template, "Could not identify which exercise you want an alternative for. Please specify the exercise name more clearly."
+            # No target exercise identified - provide helpful guidance
+            return template, "Could not identify which exercise you want an alternative for. Please specify the exercise name more clearly. For example: 'give alternate for dumbell inclined flyes' or 'replace bench press with push ups'."
 
 def handle_remove_exercise(template: Dict[str, Any], instruction: str, instruction_lower: str) -> Tuple[Dict[str, Any], str]:
     """
