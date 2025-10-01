@@ -1,7 +1,7 @@
 from __future__ import annotations
 import os, orjson, uuid, re, secrets, traceback
 from typing import Dict, Any, Optional, List, Tuple
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Depends, Query, UploadFile, File
 from fastapi.responses import StreamingResponse
 from fastapi_limiter.depends import RateLimiter
 from sqlalchemy.orm import Session
@@ -18,7 +18,7 @@ from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_struc
     _persist_payload
 )
 
-from app.models.deps import get_mem, get_oai
+from app.models.deps import get_mem, get_oai, get_http
 from app.models.database import get_db
 from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.llm_helpers import (
    sse_json, OPENAI_MODEL, is_yes as _is_yes_base, is_no as _is_no_base
@@ -34,6 +34,7 @@ from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_llm_h
 )
 from app.models.fittbot_models import Client, WeightJourney, WorkoutTemplate, ClientTarget
 from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.exercise_catalog_db import load_catalog, id_for_name
+from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.asr import transcribe_audio
 
 
 def _generate_unique_day_key(template_name: str, existing_keys: set) -> str:
@@ -615,6 +616,68 @@ def _get_exercise_emoji(exercise_name: str) -> str:
     else:
         return "🏋️"
 router = APIRouter(prefix="/workout_template", tags=["workout_template"])
+
+@router.post("/voice/transcribe")
+async def voice_transcribe(
+    audio: UploadFile = File(...),
+    http = Depends(get_http),
+    oai = Depends(get_oai),
+):
+    """Transcribe audio to text and translate to English"""
+    transcript = await transcribe_audio(audio, http=http)
+    if not transcript:
+        raise HTTPException(400, "empty transcript")
+
+    def _translate_to_english(text: str) -> dict:
+        try:
+            sys = (
+                "You are a translator. Output ONLY JSON like "
+                "{\"lang\":\"xx\",\"english\":\"...\"}. "
+                "Detect source language code (ISO-639-1 if possible). "
+                "Translate to natural English. Do not add extra words. "
+                "Keep exercise names recognizable; use common transliterations if needed."
+            )
+            resp = oai.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role":"system","content":sys},{"role":"user","content":text}],
+                response_format={"type":"json_object"},
+                temperature=0
+            )
+            return orjson.loads(resp.choices[0].message.content)
+        except Exception as e:
+            print(f"Translation error: {e}")
+            return {"lang": "unknown", "english": text}
+
+    result = _translate_to_english(transcript)
+    return {
+        "transcript": transcript,
+        "detected_language": result.get("lang", "unknown"),
+        "english_text": result.get("english", transcript)
+    }
+
+@router.post("/voice/stream")
+async def voice_stream_sse(
+    user_id: int,
+    audio: UploadFile = File(...),
+    mem = Depends(get_mem),
+    oai = Depends(get_oai),
+    http = Depends(get_http),
+    db: Session = Depends(get_db),
+):
+    """Transcribe audio and process it through the workout template stream"""
+    transcript = await transcribe_audio(audio, http=http)
+    if not transcript:
+        raise HTTPException(400, "empty transcript")
+
+    # Use the existing workout stream function with the transcript
+    return await ultra_flexible_workout_stream(
+        user_id=user_id,
+        text=transcript,
+        mem=mem,
+        oai=oai,
+        db=db
+    )
+
 # ═══════════════════════════════════════════════════════════════
 # ENHANCED FLEXIBLE NATURAL LANGUAGE PROCESSING
 # ═══════════════════════════════════════════════════════════════
@@ -1604,7 +1667,7 @@ async def ultra_flexible_workout_stream(
                 "profile": prof
             })
 
-            message = f"Hi! I'm your workout template assistant. Here's your current profile:\n\n{profile_display}\n\nWould you like me to create a workout plan based on this profile, or do you have any specific preferences or changes you'd like to make first?"
+            message = f"Hi! I'm your workout template assistant. Here's your current profile:\n\n{profile_display}\n\nWould you like me to create a workout plan based on this profile?"
             print(f"🔍 DEBUG - START state message: {message}")
 
             yield _evt({
@@ -1743,7 +1806,8 @@ async def ultra_flexible_workout_stream(
            yield _evt({
                "type": "workout_template",
                "status": "ask_names",
-               "message": f"Perfect! {days_count} workout days it is.\n\nTime to name your workout days! Get creative:\n• Animal names: 'Give animal names'\n• King names: 'Give king names for each'\n• Superhero names: 'Use superhero names'\n• Specific names: 'First day Lion, second day Tiger'\n• Or say 'default' for standard names"
+               "message": f"🔥 Perfect! {days_count} workout days locked in!\n\n💡 Now let’s give your workout days some epic names. Choose your vibe:\n\n🐾 Animal Power → 'Give animal names'\n👑 Royal Legacy → 'Give king names for each'\n🦸 Hero Mode → 'Use superhero names'\n🦁 Custom Beast Mode → 'First day Lion, second day Tiger'\n✨ Or just say 'default' for classic names!"
+
            })
            yield "event: done\ndata: [DONE]\n\n"
 
