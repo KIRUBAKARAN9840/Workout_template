@@ -286,6 +286,57 @@ def _ensure_unique_exercise_ids(template: dict) -> dict:
     return template
 
 
+def _generate_ai_day_names(user_request: str, days_count: int, oai, model: str = "gpt-3.5-turbo") -> List[str]:
+    """Generate creative day names based on user's request using AI"""
+
+    system_prompt = f"""You are a creative workout day naming assistant. Generate exactly {days_count} unique, creative names for workout days based on the user's request.
+
+Rules:
+1. Generate exactly {days_count} names
+2. Names should be single words only (no spaces)
+3. Names should be appropriate for workout days
+4. Make them fun and motivating
+5. Follow the user's theme/request as closely as possible
+
+Return ONLY a JSON array of strings, nothing else.
+
+Examples:
+- User: "animal names" → ["Lion", "Tiger", "Bear", "Wolf", "Eagle"]
+- User: "king names" → ["Arthur", "Alexander", "Napoleon", "Caesar", "Viking"]
+- User: "superhero names" → ["Thor", "Hulk", "Superman", "Captain", "Storm"]
+- User: "first 2 days Lion and Tiger" → ["Lion", "Tiger", "Day3", "Day4", "Day5"]
+"""
+
+    try:
+        response = oai.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"User request: '{user_request}' for {days_count} workout days"}
+            ],
+            temperature=0.7,
+            max_tokens=200
+        )
+
+        result_text = response.choices[0].message.content.strip()
+
+        # Try to parse JSON response
+        import json
+        day_names = json.loads(result_text)
+
+        # Validate we got the right number of names
+        if isinstance(day_names, list) and len(day_names) == days_count:
+            return [str(name).title() for name in day_names]
+        else:
+            # Fallback if AI didn't return correct format
+            return [f"Day{i+1}" for i in range(days_count)]
+
+    except Exception as e:
+        print(f"AI day naming failed: {e}")
+        # Fallback to default names
+        return [f"Day{i+1}" for i in range(days_count)]
+
+
 def _generate_template_name_from_days(template_days: dict) -> str:
     """Generate meaningful template name based on day titles and muscle groups"""
     if not template_days:
@@ -1236,10 +1287,10 @@ class SmartResponseGenerator:
             ],
       
        "ASK_NAMES": [
-            "What do you want to name your workout days? You can say 'Monday, Tuesday', use muscle groups like 'Push, Pull, Legs', or make your own names — or say 'nothing' or 'default' to use standard day names.",
-            "How should I name your workouts? Use normal day names, muscle groups, or any names you like — or say 'skip' or 'default' to use standard day names.",
-            "Time to name your workouts! You can keep it simple with days of the week, use body parts like 'Chest, Back, Legs', or make fun custom names — or say 'nothing' to use standard day names.",
-            "What names do you prefer for your workouts? Days of the week, muscle groups, or your own creative names are all fine — or say 'default' to use standard day names."
+            "Time to name your workout days! Get creative: 'Give animal names', 'Use king names', 'Superhero themes', or 'First day Lion, second Tiger' — or say 'default' for standard names.",
+            "Let's name your workouts! Try: 'Animal names for each day', 'Warrior names', 'Planet names', or be specific like 'Day 1 Beast, Day 2 Thunder' — or say 'default' for simple names.",
+            "What theme do you want for your workout names? 'Animal kingdom', 'Greek gods', 'Movie heroes', or make your own like 'Lion, Eagle, Wolf' — or say 'default' for Day 1, Day 2, etc.",
+            "Choose your workout day style! 'Give me beast names', 'Use mythical creatures', 'Storm names', or specify like 'First 3 days: Fire, Water, Earth' — or say 'default' for standard names."
             ],
       
        "EDIT_DECISION": [
@@ -1257,9 +1308,9 @@ class SmartResponseGenerator:
        ],
       
        "APPLY_EDIT": [
-           "What would you like to change? Describe it however feels natural - 'make Monday harder', 'swap bench press for dumbbell press', 'add more leg exercises', etc.",
-           "Tell me your modifications! I understand requests like 'more cardio on Friday', 'easier warm-up', 'different exercises for shoulders' - just say it naturally!",
-           "What needs adjusting? Whether it's 'increase reps', 'change the order', 'add rest day', or 'make it more challenging' - describe it your way!",
+           "What would you like to change? Describe it however feels natural - 'make Monday harder', 'swap bench press for dumbbell press', 'give all days animal names', etc.",
+           "Tell me your modifications! I understand requests like 'more cardio on Friday', 'easier warm-up', 'rename all days with superhero names' - just say it naturally!",
+           "What needs adjusting? Whether it's 'increase reps', 'change the order', 'use warrior names for all days', or 'make it more challenging' - describe it your way!",
            "How should I modify this? You can request anything - 'less volume', 'different muscle focus', 'swap exercises', or 'make specific days different' - I'll understand!"
        ]
    }
@@ -1692,7 +1743,7 @@ async def ultra_flexible_workout_stream(
            yield _evt({
                "type": "workout_template",
                "status": "ask_names",
-               "message": f"Perfect! {days_count} workout days it is.\n\nDo you want to name your workout days? You can use day names (Monday, Tuesday...) or muscle groups (Push, Pull, Legs) or say 'default' to use standard names."
+               "message": f"Perfect! {days_count} workout days it is.\n\nTime to name your workout days! Get creative:\n• Animal names: 'Give animal names'\n• King names: 'Give king names for each'\n• Superhero names: 'Use superhero names'\n• Specific names: 'First day Lion, second day Tiger'\n• Or say 'default' for standard names"
            })
            yield "event: done\ndata: [DONE]\n\n"
 
@@ -1708,18 +1759,25 @@ async def ultra_flexible_workout_stream(
        if current_state == FlexibleConversationState.STATES["ASK_NAMES"]:
            days_count = prof.get("days_count", 5)
 
-           # Extract names from user input or use defaults
-           if "default" in user_input.lower():
+           # Check for default/skip keywords
+           default_keywords = ["default", "nothing", "skip", "standard", "normal", "no"]
+           if any(keyword in user_input.lower() for keyword in default_keywords):
                day_names = [f"Day {i+1}" for i in range(days_count)]
            else:
-               # Try to extract names from user input
-               extracted_names = ai_analysis.get("day_names", [])
-               if extracted_names and len(extracted_names) >= days_count:
-                   day_names = extracted_names[:days_count]
-               else:
-                   # Use standard day names
-                   standard_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-                   day_names = standard_days[:days_count]
+               # Use AI to generate creative day names based on user's request
+               try:
+                   day_names = _generate_ai_day_names(user_input, days_count, oai, OPENAI_MODEL)
+                   print(f"🎯 AI generated day names: {day_names}")
+               except Exception as e:
+                   print(f"AI day naming failed: {e}")
+                   # Fallback to extracted names
+                   extracted_names = ai_analysis.get("day_names", [])
+                   if extracted_names and len(extracted_names) >= days_count:
+                       day_names = extracted_names[:days_count]
+                   else:
+                       # Use standard day names as final fallback
+                       standard_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+                       day_names = standard_days[:days_count]
 
            prof["template_names"] = day_names
            prof["template_count"] = len(day_names)
@@ -1950,7 +2008,7 @@ async def ultra_flexible_workout_stream(
                    yield _evt({
                        "type": "workout_template",
                        "status": "ask_for_edits",
-                       "message": "What would you like to change? You can say things like:\n• 'Change day 1 name to Lion'\n• 'Rename Monday to Beast Mode'\n• 'Call day 2 Thunder'\n• 'Add more chest exercises'\n• 'Remove squats and add lunges'\n• 'Make it easier'"
+                       "message": "What would you like to change? You can say things like:\n• 'Change day 1 name to Lion'\n• 'Give all days animal names'\n• 'Use superhero names for all days'\n• 'Rename all days with warrior names'\n• 'Add more chest exercises'\n• 'Remove squats and add lunges'\n• 'Make it easier'"
                    })
                    yield "event: done\ndata: [DONE]\n\n"
 
@@ -1981,27 +2039,132 @@ async def ultra_flexible_workout_stream(
 
     async def _apply_edit():
         try:
-            # Validate exercises using new AI system before editing
-            from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.ai_exercise_validator import AIExerciseValidator
-            from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_llm_helper import enhanced_edit_template_database_only
+            # Use AI to intelligently detect if this is a day renaming request
+            rename_detection_prompt = f"""Analyze this user request and determine if they want to rename workout days or change exercises.
 
-            validation_result = AIExerciseValidator.validate_and_suggest_exercises(oai, OPENAI_MODEL, user_input, db)
+User request: "{user_input}"
 
-            # If request contains invalid exercises, return suggestions instead of editing
-            if not validation_result['can_fulfill'] and validation_result['invalid_exercises']:
-                yield _evt({
-                    "type": "workout_template",
-                    "status": "exercise_suggestions",
-                    "message": validation_result['user_friendly_message']
-                })
-                yield "event: done\ndata: [DONE]\n\n"
-                return
+Respond with ONLY one word:
+- "BULK_RENAME" if they want to rename all/multiple days (like "give all days animal names", "use superhero names")
+- "INDIVIDUAL_RENAME" if they want to rename a specific day (like "change day 1 name to spiderman", "rename Monday to beast")
+- "EXERCISE_CHANGE" if they want to modify exercises (like "add chest exercises", "remove squats")
 
-            # Call enhanced edit function with database-validated exercises only
-            new_tpl, summary = enhanced_edit_template_database_only(oai, OPENAI_MODEL, tpl, user_input, prof, db, validation_result)
+Examples:
+- "Change day 1 name as spiderman" → INDIVIDUAL_RENAME
+- "Give all days animal names" → BULK_RENAME
+- "Add more chest exercises" → EXERCISE_CHANGE
+- "Rename day 2 to batman" → INDIVIDUAL_RENAME
+- "Remove squats" → EXERCISE_CHANGE
+
+Response:"""
+
+            try:
+                response = oai.chat.completions.create(
+                    model=OPENAI_MODEL,
+                    messages=[{"role": "user", "content": rename_detection_prompt}],
+                    temperature=0.1,
+                    max_tokens=10
+                )
+
+                intent_type = response.choices[0].message.content.strip().upper()
+                print(f"🔍 AI detected intent: {intent_type}")
+
+            except Exception as e:
+                print(f"AI intent detection failed: {e}")
+                intent_type = "EXERCISE_CHANGE"  # Default fallback
+
+            if intent_type == "BULK_RENAME":
+                # Handle bulk AI renaming
+                days_count = len(tpl.get("days", {}))
+                try:
+                    new_day_names = _generate_ai_day_names(user_input, days_count, oai, OPENAI_MODEL)
+                    print(f"🎯 AI bulk rename generated: {new_day_names}")
+
+                    # Apply new names to all days
+                    new_tpl = tpl.copy()
+                    day_keys = list(new_tpl["days"].keys())
+
+                    for i, day_key in enumerate(day_keys):
+                        if i < len(new_day_names):
+                            new_tpl["days"][day_key]["title"] = new_day_names[i]
+
+                    summary = f"Renamed all days to: {', '.join(new_day_names)}"
+
+                except Exception as e:
+                    print(f"AI bulk rename failed: {e}")
+                    summary = "Could not generate new day names. Please try again."
+                    new_tpl = tpl
+
+            elif intent_type == "INDIVIDUAL_RENAME":
+                # Handle individual day renaming (like "Change day 1 name as spiderman")
+                from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_llm_helper import _handle_day_rename
+
+                # Create a mock intent object for the rename function
+                intent = {
+                    'action': 'rename_day',
+                    'target_day': None,
+                    'new_name': None
+                }
+
+                try:
+                    # Debug: Print template titles before rename
+                    print(f"🔍 Template titles BEFORE rename:")
+                    for day_key, day_data in tpl.get("days", {}).items():
+                        print(f"  {day_key}: {day_data.get('title', 'No title')}")
+
+                    result = _handle_day_rename(tpl, user_input, intent)
+
+                    # Debug: Print template titles after rename
+                    print(f"🔍 Template titles AFTER rename:")
+                    for day_key, day_data in tpl.get("days", {}).items():
+                        print(f"  {day_key}: {day_data.get('title', 'No title')}")
+
+                    print(f"🔍 Rename result: {result}")
+
+                    if result['success']:
+                        new_tpl = tpl  # Template was modified in-place
+                        summary = result['message']
+                    else:
+                        new_tpl = tpl
+                        summary = result['message']
+                except Exception as e:
+                    print(f"Individual rename failed: {e}")
+                    summary = "Could not rename the day. Please try again."
+                    new_tpl = tpl
+
+            else:
+                # Handle regular editing (exercises, individual renames, etc.)
+                from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.ai_exercise_validator import AIExerciseValidator
+                from app.fittbot_api.v1.client.client_api.chatbot.chatbot_services.workout_llm_helper import enhanced_edit_template_database_only
+
+                validation_result = AIExerciseValidator.validate_and_suggest_exercises(oai, OPENAI_MODEL, user_input, db)
+
+                # If request contains invalid exercises, return suggestions instead of editing
+                if not validation_result['can_fulfill'] and validation_result['invalid_exercises']:
+                    yield _evt({
+                        "type": "workout_template",
+                        "status": "exercise_suggestions",
+                        "message": validation_result['user_friendly_message']
+                    })
+                    yield "event: done\ndata: [DONE]\n\n"
+                    return
+
+                # Call enhanced edit function with database-validated exercises only
+                new_tpl, summary = enhanced_edit_template_database_only(oai, OPENAI_MODEL, tpl, user_input, prof, db, validation_result)
+
+            # Debug: Print template titles before _ensure_unique_exercise_ids
+            print(f"🔍 Template titles BEFORE _ensure_unique_exercise_ids:")
+            for day_key, day_data in new_tpl.get("days", {}).items():
+                print(f"  {day_key}: {day_data.get('title', 'No title')}")
 
             # Ensure unique exercise IDs before rendering
             new_tpl = _ensure_unique_exercise_ids(new_tpl)
+
+            # Debug: Print template titles after _ensure_unique_exercise_ids
+            print(f"🔍 Template titles AFTER _ensure_unique_exercise_ids:")
+            for day_key, day_data in new_tpl.get("days", {}).items():
+                print(f"  {day_key}: {day_data.get('title', 'No title')}")
+
             md = render_markdown_from_template(new_tpl)
             tpl_ids = build_id_only_structure(new_tpl)
 
