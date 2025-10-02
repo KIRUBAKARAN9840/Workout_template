@@ -1782,15 +1782,18 @@ async def ultra_flexible_workout_stream(
 
    # ASK_DAYS STATE - User provides number of days
    elif current_state == FlexibleConversationState.STATES["ASK_DAYS"]:
-       # Simple rule-based days extraction
-       import re
-       days_match = re.search(r'\b(\d+)\s*(?:days?|workouts?)\b', user_input.lower())
-       if days_match:
-           days_count = int(days_match.group(1))
-       else:
-           # Try to find standalone numbers
-           number_match = re.search(r'\b([3-7])\b', user_input)
-           days_count = int(number_match.group(1)) if number_match else 5
+       # Use the flexible parser to handle natural language inputs
+       days_count = UltraFlexibleParser.extract_days_count(user_input)
+       if days_count is None:
+           # Fallback to simple parsing if flexible parser fails
+           import re
+           days_match = re.search(r'\b(\d+)\s*(?:days?|workouts?)\b', user_input.lower())
+           if days_match:
+               days_count = int(days_match.group(1))
+           else:
+               # Try to find standalone numbers
+               number_match = re.search(r'\b([3-7])\b', user_input)
+               days_count = int(number_match.group(1)) if number_match else 5
        prof = pend.get("profile", {})
        prof["days_count"] = days_count
 
@@ -2265,7 +2268,23 @@ Response:"""
     prof = pend.get("profile", {})
     tpl = pend.get("template", {})
 
-    if ai_analysis.get("positive_sentiment") or user_intent in ["save", "yes"] or user_input.lower().strip() in ['save', 'yes', 'confirm']:
+    # Enhanced save confirmation patterns
+    save_confirmations = [
+        'save', 'yes', 'confirm', 'save it', 'yes save', 'save please',
+        'no change', 'no change, save', 'go ahead', 'proceed', 'ok', 'okay',
+        'looks good', 'perfect', 'good to go', 'ready', 'done', 'finalize'
+    ]
+    user_input_lower = user_input.lower().strip()
+
+    # Check for save confirmation
+    is_save_request = (
+        ai_analysis.get("positive_sentiment") or
+        user_intent in ["save", "yes"] or
+        user_input_lower in save_confirmations or
+        any(pattern in user_input_lower for pattern in ['save', 'yes', 'confirm', 'ok'])
+    )
+
+    if is_save_request:
         # Save the template
         # Generate intelligent template name
         template_name = tpl.get("name") or _generate_template_name_from_days(tpl.get("days", {}))
