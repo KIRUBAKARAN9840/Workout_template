@@ -257,6 +257,13 @@ def _ensure_unique_exercise_ids(template: dict) -> dict:
     if not template or not template.get('days'):
         return template
 
+    # Debug: Log IDs before processing
+    print("🔍 _ensure_unique_exercise_ids - BEFORE:")
+    for day_key, day_data in template.get('days', {}).items():
+        if isinstance(day_data, dict) and 'exercises' in day_data:
+            ids = [ex.get('id', 'NO_ID') for ex in day_data.get('exercises', [])]
+            print(f"  {day_key}: {ids}")
+
     used_ids = set()
     next_id = 1
 
@@ -267,22 +274,40 @@ def _ensure_unique_exercise_ids(template: dict) -> dict:
                 if isinstance(exercise, dict) and 'id' in exercise:
                     exercise_id = exercise['id']
                     if isinstance(exercise_id, int):
-                        used_ids.add(exercise_id)
-                        next_id = max(next_id, exercise_id + 1)
+                        if exercise_id >= next_id:
+                            next_id = exercise_id + 1
 
     # Second pass: assign unique IDs to any exercises without IDs or with duplicate IDs
+    seen_ids = set()
+    reassigned_count = 0
     for day_data in template['days'].values():
         if isinstance(day_data, dict) and 'exercises' in day_data:
             exercises = day_data.get('exercises', [])
             for exercise in exercises:
                 if isinstance(exercise, dict):
-                    if 'id' not in exercise or exercise['id'] in used_ids:
+                    current_id = exercise.get('id')
+                    # Reassign if no ID, or if ID is already seen (duplicate)
+                    if 'id' not in exercise or not isinstance(current_id, int) or current_id in seen_ids:
                         # Find next available ID
-                        while next_id in used_ids:
+                        while next_id in seen_ids:
                             next_id += 1
+                        if 'id' in exercise and current_id in seen_ids:
+                            print(f"  ⚠️  Found duplicate ID {current_id}, reassigning to {next_id}")
+                            reassigned_count += 1
                         exercise['id'] = next_id
-                        used_ids.add(next_id)
+                        seen_ids.add(next_id)
                         next_id += 1
+                    else:
+                        # Mark this ID as seen
+                        seen_ids.add(current_id)
+
+    # Debug: Log IDs after processing
+    print("🔍 _ensure_unique_exercise_ids - AFTER:")
+    for day_key, day_data in template.get('days', {}).items():
+        if isinstance(day_data, dict) and 'exercises' in day_data:
+            ids = [ex.get('id') for ex in day_data.get('exercises', [])]
+            print(f"  {day_key}: {ids}")
+    print(f"  Reassigned {reassigned_count} duplicate IDs")
 
     return template
 
@@ -1525,8 +1550,8 @@ async def _get_saved_template(mem, db: Session, client_id: int) -> Optional[Dict
        raw = await mem.r.get(f"workout_template:{client_id}")
        if raw:
            obj = orjson.loads(raw)
-           if "template" in obj and "template_ids" not in obj:
-               # Ensure unique exercise IDs before building structure
+           if "template" in obj:
+               # ALWAYS ensure unique exercise IDs when loading from cache
                obj["template"] = _ensure_unique_exercise_ids(obj["template"])
                obj["template_ids"] = build_id_only_structure(obj["template"])
            return obj
@@ -1902,12 +1927,27 @@ async def ultra_flexible_workout_stream(
                md = render_markdown_from_template(tpl)
                tpl_ids = build_id_only_structure(tpl)
 
-               # Update state
+               # Update state - use deep copy to prevent reference issues
+               import copy
                await mem.set_pending(user_id, {
                    "state": FlexibleConversationState.STATES["EDIT_DECISION"],
                    "profile": prof,
-                   "template": tpl
+                   "template": copy.deepcopy(tpl)
                })
+
+               # DEBUG: Print actual IDs being sent to frontend
+               print("🔍 SENDING TO FRONTEND:")
+               print(f"  template_ids: {tpl_ids}")
+               for day_key, day_data in tpl.get('days', {}).items():
+                   exercise_ids = [ex.get('id', 'NO_ID') for ex in day_data.get('exercises', [])]
+                   print(f"  {day_key} exercise IDs in template_json: {exercise_ids}")
+
+               # Check for duplicates
+               all_ids_in_json = [ex.get('id') for day in tpl.get('days', {}).values() for ex in day.get('exercises', [])]
+               if len(all_ids_in_json) != len(set(all_ids_in_json)):
+                   print(f"  ⚠️  DUPLICATE IDs FOUND IN TEMPLATE_JSON: {all_ids_in_json}")
+               else:
+                   print(f"  ✓ All IDs unique in template_json: {all_ids_in_json}")
 
                # Return success response with template in message field for frontend display
                yield _evt({
@@ -1946,8 +1986,9 @@ async def ultra_flexible_workout_stream(
 
    # EDIT_DECISION STATE - User decides to edit or save template
    elif current_state == FlexibleConversationState.STATES["EDIT_DECISION"]:
+       import copy
        prof = pend.get("profile", {})
-       tpl = pend.get("template", {})
+       tpl = copy.deepcopy(pend.get("template", {}))
 
        # Check if user wants to save
        save_commands = ['save', 'save it', 'store', 'store it', 'keep', 'keep it', 'perfect', 'looks good', 'good to go',
@@ -1955,10 +1996,11 @@ async def ultra_flexible_workout_stream(
                        'save template', 'save plan', 'save workout', 'this is good', 'looks great', 'all set']
        if any(cmd in user_input.lower() for cmd in save_commands):
            # User wants to save - move to CONFIRM_SAVE
+           import copy
            await mem.set_pending(user_id, {
                "state": FlexibleConversationState.STATES["CONFIRM_SAVE"],
                "profile": prof,
-               "template": tpl
+               "template": copy.deepcopy(tpl)
            })
 
            async def _confirm_save():
@@ -2028,10 +2070,11 @@ async def ultra_flexible_workout_stream(
                        md = render_markdown_from_template(new_tpl)
                        tpl_ids = build_id_only_structure(new_tpl)
 
+                       import copy
                        await mem.set_pending(user_id, {
                            "state": FlexibleConversationState.STATES["EDIT_DECISION"],
                            "profile": prof,
-                           "template": new_tpl
+                           "template": copy.deepcopy(new_tpl)
                        })
 
                        yield _evt({
@@ -2065,10 +2108,11 @@ async def ultra_flexible_workout_stream(
 
            else:
                # User input is unclear - ask for clarification
+               import copy
                await mem.set_pending(user_id, {
                    "state": FlexibleConversationState.STATES["APPLY_EDIT"],
                    "profile": prof,
-                   "template": tpl
+                   "template": copy.deepcopy(tpl)
                })
 
                async def _ask_for_edits():
@@ -2084,14 +2128,19 @@ async def ultra_flexible_workout_stream(
 
    # APPLY_EDIT STATE
    elif current_state == FlexibleConversationState.STATES["APPLY_EDIT"]:
+    import copy
     prof = pend.get("profile", {})
     tpl = pend.get("template")
+
+    # Deep copy to prevent reference issues
+    if tpl:
+        tpl = copy.deepcopy(tpl)
 
     # If no current template, try to get saved one
     if not tpl:
         saved = await _get_saved_template(mem, db, user_id)
         if saved:
-            tpl = saved.get("template", {})
+            tpl = copy.deepcopy(saved.get("template", {}))
             prof = prof or {}
         else:
             async def _need_template():
@@ -2147,8 +2196,9 @@ Response:"""
                     new_day_names = _generate_ai_day_names(user_input, days_count, oai, OPENAI_MODEL)
                     print(f"🎯 AI bulk rename generated: {new_day_names}")
 
-                    # Apply new names to all days
-                    new_tpl = tpl.copy()
+                    # Apply new names to all days - use deep copy to avoid modifying original
+                    import copy
+                    new_tpl = copy.deepcopy(tpl)
                     day_keys = list(new_tpl["days"].keys())
 
                     for i, day_key in enumerate(day_keys):
@@ -2235,10 +2285,11 @@ Response:"""
             md = render_markdown_from_template(new_tpl)
             tpl_ids = build_id_only_structure(new_tpl)
 
+            import copy
             await mem.set_pending(user_id, {
                 "state": FlexibleConversationState.STATES["EDIT_DECISION"],
                 "profile": prof,
-                "template": new_tpl
+                "template": copy.deepcopy(new_tpl)
             })
 
             yield _evt({
@@ -2265,8 +2316,9 @@ Response:"""
 
    # CONFIRM_SAVE STATE
    elif current_state == FlexibleConversationState.STATES["CONFIRM_SAVE"]:
+    import copy
     prof = pend.get("profile", {})
-    tpl = pend.get("template", {})
+    tpl = copy.deepcopy(pend.get("template", {}))
 
     # Enhanced save confirmation patterns
     save_confirmations = [
@@ -2407,10 +2459,11 @@ Response:"""
 
     elif ai_analysis.get("negative_sentiment") or user_intent == "no":
         # Go back to editing
+        import copy
         await mem.set_pending(user_id, {
             "state": FlexibleConversationState.STATES["EDIT_DECISION"],
             "profile": prof,
-            "template": tpl
+            "template": copy.deepcopy(tpl)
         })
 
         async def _back_to_edit():
