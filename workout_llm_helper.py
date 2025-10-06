@@ -631,7 +631,8 @@ class SmartWorkoutEditor:
     @classmethod
     def apply_title_change(cls, template: dict, target_day: str, new_title: str) -> Tuple[dict, str]:
         """Apply day name change - changes both the day key and the display title"""
-        updated = template.copy()
+        import copy
+        updated = copy.deepcopy(template)
         days = updated.get('days', {})
 
         # Find the actual day key in the template
@@ -1463,7 +1464,7 @@ def llm_generate_template_from_profile_database_only(oai, model: str, profile: D
 
             # Assign muscle groups cyclically
             assigned_muscle_groups = []
-            exercises_per_day = max(3, 6 // template_count)  # At least 3 exercises per day
+            exercises_per_day = 6  # Always 6 exercises per day for optimal workout volume
 
             if template_count <= len(target_muscle_groups):
                 # One muscle group per day
@@ -1487,6 +1488,8 @@ def llm_generate_template_from_profile_database_only(oai, model: str, profile: D
                 for exercise in selected_exercises:
                     # Add default sets/reps
                     exercise_copy = exercise.copy()
+                    # Remove id to prevent duplicates - will be assigned by _ensure_unique_exercise_ids
+                    exercise_copy.pop('id', None)
                     if exercise.get('isCardio'):
                         exercise_copy['sets'] = 1
                         exercise_copy['reps'] = '20 minutes'
@@ -1497,7 +1500,7 @@ def llm_generate_template_from_profile_database_only(oai, model: str, profile: D
                     day_exercises.append(exercise_copy)
 
             # Ensure minimum exercises per day
-            while len(day_exercises) < 3:
+            while len(day_exercises) < 6:
                 # Add more exercises from any available muscle group
                 additional_muscle = target_muscle_groups[len(day_exercises) % len(target_muscle_groups)]
                 additional_exercises = DatabaseExerciseManager.get_available_exercises_by_muscle(db, additional_muscle)
@@ -1508,6 +1511,8 @@ def llm_generate_template_from_profile_database_only(oai, model: str, profile: D
                     for exercise in additional_exercises:
                         if exercise['name'] not in existing_names:
                             exercise_copy = exercise.copy()
+                            # Remove id to prevent duplicates - will be assigned by _ensure_unique_exercise_ids
+                            exercise_copy.pop('id', None)
                             exercise_copy['sets'] = 3
                             exercise_copy['reps'] = 12 if exercise.get('isBodyWeight') else 10
                             day_exercises.append(exercise_copy)
@@ -1545,12 +1550,8 @@ def enhanced_edit_template_database_only(oai, model: str, template: Dict[str, An
         from .ai_exercise_validator import AIExerciseValidator
 
         # Make a deep copy of the template to work with
-        new_template = template.copy()
-        new_template['days'] = {}
-        for day_key, day_data in template.get('days', {}).items():
-            new_template['days'][day_key] = day_data.copy()
-            if 'exercises' in day_data:
-                new_template['days'][day_key]['exercises'] = [ex.copy() for ex in day_data['exercises']]
+        import copy
+        new_template = copy.deepcopy(template)
 
         edit_summary = []
         instruction_lower = user_instruction.lower()
@@ -1900,6 +1901,8 @@ def _handle_exercise_addition(template: Dict[str, Any], user_instruction: str, v
 
                 if not exercise_exists:
                     new_exercise = exercise_data.copy()
+                    # Remove id to prevent duplicates - will be assigned by _ensure_unique_exercise_ids
+                    new_exercise.pop('id', None)
                     new_exercise['sets'] = 3
                     new_exercise['reps'] = 12 if exercise_data.get('isBodyWeight') else 10
                     current_exercises.append(new_exercise)
@@ -1917,6 +1920,8 @@ def _handle_exercise_addition(template: Dict[str, Any], user_instruction: str, v
 
             if not exercise_exists:
                 new_exercise = exercise_data.copy()
+                # Remove id to prevent duplicates - will be assigned by _ensure_unique_exercise_ids
+                new_exercise.pop('id', None)
                 new_exercise['sets'] = 3
                 new_exercise['reps'] = 12 if exercise_data.get('isBodyWeight') else 10
                 current_exercises.append(new_exercise)
@@ -1933,6 +1938,8 @@ def _handle_exercise_addition(template: Dict[str, Any], user_instruction: str, v
             for exercise_data in validated_exercises:
                 current_exercises = template['days'][target_day].get('exercises', [])
                 new_exercise = exercise_data.copy()
+                # Remove id to prevent duplicates - will be assigned by _ensure_unique_exercise_ids
+                new_exercise.pop('id', None)
                 new_exercise['sets'] = 3
                 new_exercise['reps'] = 12 if exercise_data.get('isBodyWeight') else 10
                 current_exercises.append(new_exercise)
@@ -2016,6 +2023,8 @@ def _handle_muscle_group_addition(template: Dict[str, Any], user_instruction: st
                         exercise_exists = any(ex.get('name', '').lower() == exercise['name'].lower() for ex in current_exercises)
                         if not exercise_exists:
                             new_exercise = exercise.copy()
+                            # Remove id to prevent duplicates - will be assigned by _ensure_unique_exercise_ids
+                            new_exercise.pop('id', None)
                             new_exercise['sets'] = 3
                             new_exercise['reps'] = 12 if exercise.get('isBodyWeight') else 10
                             current_exercises.append(new_exercise)
@@ -2032,6 +2041,8 @@ def _handle_muscle_group_addition(template: Dict[str, Any], user_instruction: st
                     exercise_exists = any(ex.get('name', '').lower() == exercise['name'].lower() for ex in current_exercises)
                     if not exercise_exists:
                         new_exercise = exercise.copy()
+                        # Remove id to prevent duplicates - will be assigned by _ensure_unique_exercise_ids
+                        new_exercise.pop('id', None)
                         new_exercise['sets'] = 3
                         new_exercise['reps'] = 12 if exercise.get('isBodyWeight') else 10
                         current_exercises.append(new_exercise)
@@ -2052,6 +2063,8 @@ def _handle_muscle_group_addition(template: Dict[str, Any], user_instruction: st
                         exercise_exists = any(ex.get('name', '').lower() == exercise['name'].lower() for ex in current_exercises)
                         if not exercise_exists:
                             new_exercise = exercise.copy()
+                            # Remove id to prevent duplicates - will be assigned by _ensure_unique_exercise_ids
+                            new_exercise.pop('id', None)
                             new_exercise['sets'] = 3
                             new_exercise['reps'] = 12 if exercise.get('isBodyWeight') else 10
                             current_exercises.append(new_exercise)
@@ -2172,6 +2185,8 @@ Response (exact name only):"""
 
                     # Replace the exercise
                     new_exercise = exercise_data.copy()
+                    # Remove id to prevent duplicates - will be assigned by _ensure_unique_exercise_ids
+                    new_exercise.pop('id', None)
                     new_exercise['sets'] = original_exercise.get('sets', 3)
                     new_exercise['reps'] = original_exercise.get('reps', 10)
                     template['days'][day_key]['exercises'][index] = new_exercise
@@ -2222,6 +2237,8 @@ Response (exact name only):"""
 
                             # Replace with alternative from same muscle group
                             new_exercise = replacement_data.copy()
+                            # Remove id to prevent duplicates - will be assigned by _ensure_unique_exercise_ids
+                            new_exercise.pop('id', None)
                             new_exercise['sets'] = original_exercise.get('sets', 3)
                             new_exercise['reps'] = original_exercise.get('reps', 10)
                             template['days'][day_key]['exercises'][index] = new_exercise
@@ -2248,6 +2265,8 @@ Response (exact name only):"""
                         original_exercise = match['exercise']
 
                         new_exercise = replacement_data.copy()
+                        # Remove id to prevent duplicates - will be assigned by _ensure_unique_exercise_ids
+                        new_exercise.pop('id', None)
                         new_exercise['sets'] = original_exercise.get('sets', 3)
                         new_exercise['reps'] = original_exercise.get('reps', 10)
                         template['days'][day_key]['exercises'][index] = new_exercise
@@ -2926,16 +2945,16 @@ def handle_specific_exercise_addition(template: Dict[str,Any], instruction: str,
                         current_exercises = day_data.get("exercises", [])
 
                         # Check if exercise already exists in this day
-                        exercise_exists = any(ex.get("id") == exercise_id for ex in current_exercises)
+                        exercise_exists = any(ex.get("name", "").lower() == exercise_name.lower() for ex in current_exercises)
 
                         if not exercise_exists and len(current_exercises) < 8:
                             new_exercise = {
-                                "id": exercise_id,
                                 "name": exercise_name,
                                 "sets": 3,
                                 "reps": 10,
                                 "note": None
                             }
+                            # id will be assigned by _ensure_unique_exercise_ids
                             current_exercises.append(new_exercise)
 
                     return updated, f"Added '{exercise_name}' to all days"
@@ -3006,18 +3025,18 @@ def handle_specific_exercise_addition(template: Dict[str,Any], instruction: str,
     
     # Check if exercise already exists in this day
     for ex in current_exercises:
-        if ex.get("id") == exercise_id:
+        if ex.get("name", "").lower() == exercise_name.lower():
             return template, f"Exercise '{exercise_name}' is already in {target_day_key}."
     
     # Add the exercise
     new_exercise = {
-        "id": exercise_id,
         "name": exercise_name,
         "sets": 3,
         "reps": 10,
         "note": None
     }
-    
+    # id will be assigned by _ensure_unique_exercise_ids
+
     current_exercises.append(new_exercise)
     day_data["exercises"] = current_exercises
     
